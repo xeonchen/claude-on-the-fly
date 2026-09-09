@@ -573,7 +573,7 @@ def prepend_handoff(
     return f"{handoff}{prompt}"
 
 
-# --- failure diagnosis (experimental, codex only) ---
+# --- failure diagnosis (experimental) ---
 
 # A rollout is looked up after its run already died, so the mtime filter
 # `_find_codex_rollout_by_cwd` uses for live tailing is far too tight. A job may
@@ -662,7 +662,28 @@ def _diagnose_rollout(workspace: Path, session_uuid: str) -> Path | None:
     )
 
 
-def _tool_spans(rows: list[dict]) -> tuple[float, int, int, int]:
+@dataclass(frozen=True)
+class _RunFacts:
+    """What one finished run's transcript says, in the terms the rules need.
+
+    The two backends write different files, so each has its own reader; every
+    rule below reads this instead. `marker` is the backend's own name for "the
+    agent finished" -- `task_complete` for codex, `end_turn` for claude -- so a
+    signal names the event an operator will grep the transcript for.
+    """
+
+    marker: str
+    completed: bool
+    last_event: str
+    span: float
+    tool_wall: float
+    calls: int
+    outputs: int
+    failed: int
+    tool_inputs: str
+
+
+def _codex_tool_spans(rows: list[dict]) -> tuple[float, int, int, int]:
     """`(seconds inside tool calls, calls, outputs, failed outputs)`.
 
     Codex writes a call and its output as separate records, so the time a tool
@@ -707,6 +728,175 @@ def _row_time(row: dict) -> float | None:
         return None
 
 
+def _span(rows: list[dict]) -> float:
+    """Wall clock across rows that carry a usable timestamp, or 0.0."""
+    stamps = [stamp for stamp in (_row_time(row) for row in rows) if stamp is not None]
+    return (max(stamps) - min(stamps)) if stamps else 0.0
+
+
+def _codex_facts(rows: list[dict]) -> _RunFacts:
+    """Read a codex rollout."""
+    last = (rows[-1].get("payload") or {}).get("type") or rows[-1].get("type")
+    tool_wall, calls, outputs, failed = _codex_tool_spans(rows)
+    inputs = "\n".join(
+        json.dumps((row.get("payload") or {}).get("input", ""), default=str)
+        for row in rows
+        if (row.get("payload") or {}).get("type") == "custom_tool_call"
+    )
+    return _RunFacts(
+        marker="task_complete",
+        completed=last == "task_complete",
+        last_event=str(last),
+        span=_span(rows),
+        tool_wall=tool_wall,
+        calls=calls,
+        outputs=outputs,
+        failed=failed,
+        tool_inputs=inputs,
+    )
+
+
+def _claude_last_fire(rows: list[dict]) -> list[dict]:
+    """The rows of the newest turn in a claude session file.
+
+    A keyed job resumes its session, so the file holds every earlier fire too,
+    and reading the lot would time the run in hours and explain today's failure
+    with last week's tool calls. The boundary is the last prompt claude was
+    given: a `user` row whose content is a plain string. A tool result is a
+    `user` row as well, but its content is a list, and a subagent's prompt is a
+    string but sits on a sidechain -- neither starts a fire.
+    """
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        if row.get("type") != "user" or row.get("isSidechain"):
+            continue
+        if isinstance((row.get("message") or {}).get("content"), str):
+            return rows[index:]
+    return rows
+
+
+def _claude_blocks(row: dict, kind: str) -> list[dict]:
+    """The content blocks of one type in a claude message row."""
+    content = (row.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") == kind
+    ]
+
+
+def _claude_tool_spans(rows: list[dict]) -> tuple[float, int, int, int]:
+    """`(seconds inside tool calls, calls, outputs, failed outputs)`.
+
+    Claude pairs a `tool_use` block on an assistant row with a `tool_result`
+    block on the user row that answers it, so the gap between the two rows is
+    what the tool took. Sidechain rows count: a subagent's execs are this run's
+    work, and leaving them out would read a delegating run as a stalled one.
+
+    A claude tool result says `is_error` outright, which codex's format does
+    not. The substring markers still apply on top of it: a wrapper that reports
+    a failure in its own text without setting the flag is the case they catch.
+    """
+    tool_wall = 0.0
+    calls = outputs = failed = 0
+    open_calls: dict[object, float | None] = {}
+    for row in rows:
+        for block in _claude_blocks(row, "tool_use"):
+            calls += 1
+            open_calls[block.get("id") or calls] = _row_time(row)
+        for block in _claude_blocks(row, "tool_result"):
+            outputs += 1
+            started = open_calls.pop(block.get("tool_use_id") or outputs, None)
+            ended = _row_time(row)
+            if started is not None and ended is not None:
+                tool_wall += max(0.0, ended - started)
+            if block.get("is_error") or _looks_like_tool_error(block.get("content")):
+                failed += 1
+    return tool_wall, calls, outputs, failed
+
+
+def _claude_facts(rows: list[dict]) -> _RunFacts:
+    """Read a claude session file.
+
+    Finishing is `end_turn` **anywhere** in the fire, not on its last row. A
+    completed turn is followed by rows of its own: `system` rows for the stop
+    hook and the turn duration, then untimestamped bookkeeping (`mode`,
+    `ai-title`, `last-prompt`). Reading the stop reason off the last row called
+    9 of 96 real finished fires unfinished, and `turn_duration` is written by
+    exactly the runs that did finish.
+
+    The event to report is the last message row, so an interrupted turn is named
+    by what the agent was doing -- `assistant/tool_use` for one killed holding a
+    tool call, `assistant/stop_sequence` for one the API cut off. A fire with no
+    message row at all (the agent never answered) falls back to the last row
+    that carries a timestamp.
+    """
+    spoke = [row for row in rows if row.get("type") in {"assistant", "user"}]
+    timed = [row for row in rows if _row_time(row) is not None]
+    last = (spoke or timed or rows)[-1]
+    stop = (last.get("message") or {}).get("stop_reason")
+    label = f"{last.get('type')}/{stop}" if stop else str(last.get("type"))
+    completed = any(
+        (row.get("message") or {}).get("stop_reason") == "end_turn"
+        for row in rows
+        if not row.get("isSidechain")
+    )
+    tool_wall, calls, outputs, failed = _claude_tool_spans(rows)
+    inputs = "\n".join(
+        json.dumps(block.get("input", ""), default=str)
+        for row in rows
+        for block in _claude_blocks(row, "tool_use")
+    )
+    return _RunFacts(
+        marker="end_turn",
+        completed=completed,
+        last_event=label,
+        span=_span(rows),
+        tool_wall=tool_wall,
+        calls=calls,
+        outputs=outputs,
+        failed=failed,
+        tool_inputs=inputs,
+    )
+
+
+def _signals(facts: _RunFacts, prompt: str, timeout_s: float | None) -> list[str]:
+    """The rules themselves, over whichever backend's facts."""
+    signals: list[str] = []
+    if facts.completed:
+        # The agent finished and the job still failed, so the fault is on our
+        # side of the CLI boundary. Without this the alert reads as an agent
+        # crash and sends the operator to the wrong component.
+        signals.append(
+            f"agent reached {facts.marker} in {facts.span:.0f}s, failure is ours"
+        )
+    else:
+        signals.append(f"no {facts.marker}, last event was {facts.last_event}")
+
+    floor = timeout_s * STALL_TIMEOUT_SHARE if timeout_s else DEFAULT_STALL_FLOOR_S
+    if facts.span >= floor and facts.tool_wall < facts.span * STALL_TOOL_SHARE:
+        signals.append(
+            f"{facts.span - facts.tool_wall:.0f}s model / {facts.tool_wall:.1f}s tool, "
+            "stalled upstream"
+        )
+
+    if facts.calls:
+        for payload_name in dict.fromkeys(_PAYLOAD_PATTERN.findall(prompt)):
+            if payload_name not in facts.tool_inputs:
+                signals.append(
+                    f"payload never ran, {payload_name} absent from "
+                    f"{facts.calls} tool calls"
+                )
+
+    if facts.failed >= CAPABILITY_GAP_ERRORS:
+        signals.append(
+            f"{facts.failed}/{facts.outputs} tool results were errors, capability gap?"
+        )
+    return signals
+
+
 def diagnose_codex(
     workspace: Path,
     session_uuid: str,
@@ -716,19 +906,9 @@ def diagnose_codex(
 ) -> list[str]:
     """Deterministic signals about why a codex run failed, newest evidence only.
 
-    Experimental, and codex-only on purpose: every rule below reads a codex
-    rollout's record shapes. Claude writes a different session format, so a
-    caller on that backend gets nothing rather than a guess.
-
-    The alert a failed job already sends says what the CLI reported, which for a
-    timeout is only that it timed out. These signals answer the next question
-    an operator asks, and they are arithmetic over timestamps rather than an
-    interpretation: whether the agent finished at all, where the wall clock
-    went, whether the job's own payload ever ran, and whether the run kept
-    hitting the same failing tool.
-
-    Returns an empty list when there is no rollout or nothing stands out, so a
-    caller can append unconditionally.
+    See `diagnose` for what the signals are and why they exist. This arm reads
+    a codex rollout, which is found by thread id when the run got far enough to
+    persist one and by a cwd scan when it did not.
     """
     rollout = _diagnose_rollout(workspace, session_uuid)
     if rollout is None:
@@ -736,38 +916,54 @@ def diagnose_codex(
     rows = list(_iter_jsonl(rollout))
     if not rows:
         return []
-    signals: list[str] = []
-    started, ended = _row_time(rows[0]), _row_time(rows[-1])
-    span = (ended - started) if (started is not None and ended is not None) else 0.0
+    return _signals(_codex_facts(rows), prompt, timeout_s)
 
-    last = (rows[-1].get("payload") or {}).get("type") or rows[-1].get("type")
-    if last == "task_complete":
-        # The agent finished and the job still failed, so the fault is on our
-        # side of the CLI boundary. Without this the alert reads as an agent
-        # crash and sends the operator to the wrong component.
-        signals.append(f"agent reached task_complete in {span:.0f}s, failure is ours")
-    else:
-        signals.append(f"no task_complete, last event was {last}")
 
-    tool_wall, calls, outputs, failed = _tool_spans(rows)
-    floor = timeout_s * STALL_TIMEOUT_SHARE if timeout_s else DEFAULT_STALL_FLOOR_S
-    if span >= floor and tool_wall < span * STALL_TOOL_SHARE:
-        signals.append(
-            f"{span - tool_wall:.0f}s model / {tool_wall:.1f}s tool, stalled upstream"
-        )
+def diagnose_claude(
+    workspace: Path,
+    session_uuid: str,
+    *,
+    prompt: str = "",
+    timeout_s: float | None = None,
+) -> list[str]:
+    """Deterministic signals about why a claude run failed, newest fire only.
 
-    if calls:
-        ran = "\n".join(
-            json.dumps((row.get("payload") or {}).get("input", ""), default=str)
-            for row in rows
-            if (row.get("payload") or {}).get("type") == "custom_tool_call"
-        )
-        for payload_name in dict.fromkeys(_PAYLOAD_PATTERN.findall(prompt)):
-            if payload_name not in ran:
-                signals.append(
-                    f"payload never ran, {payload_name} absent from {calls} tool calls"
-                )
+    See `diagnose` for what the signals are and why they exist. This arm needs
+    no search: claude names the session file after the id cotf gave it, under
+    the directory it derives from the workspace path.
+    """
+    path = claude_session_dir(workspace) / f"{session_uuid}.jsonl"
+    rows = _claude_last_fire(list(_iter_jsonl(path)))
+    if not rows:
+        return []
+    return _signals(_claude_facts(rows), prompt, timeout_s)
 
-    if failed >= CAPABILITY_GAP_ERRORS:
-        signals.append(f"{failed}/{outputs} tool results were errors, capability gap?")
-    return signals
+
+_DIAGNOSERS = {"codex": diagnose_codex, "claude": diagnose_claude}
+
+
+def diagnose(
+    backend: str,
+    workspace: Path,
+    session_uuid: str,
+    *,
+    prompt: str = "",
+    timeout_s: float | None = None,
+) -> list[str]:
+    """Deterministic signals about why a run failed, for either backend.
+
+    Experimental. The alert a failed job already sends says what the CLI
+    reported, which for a timeout is only that it timed out. These signals
+    answer the next question an operator asks, and they are arithmetic over
+    timestamps rather than an interpretation: whether the agent finished at all,
+    where the wall clock went, whether the job's own payload ever ran, and
+    whether the run kept hitting the same failing tool.
+
+    Returns an empty list when the backend writes neither transcript format,
+    when there is no transcript, or when nothing stands out, so a caller can
+    append unconditionally.
+    """
+    reader = _DIAGNOSERS.get(backend)
+    if reader is None:
+        return []
+    return reader(workspace, session_uuid, prompt=prompt, timeout_s=timeout_s)

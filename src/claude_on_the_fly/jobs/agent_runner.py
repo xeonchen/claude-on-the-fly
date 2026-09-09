@@ -151,24 +151,23 @@ def _failure_signals(
 ) -> str:
     """Deterministic notes about a failed run, or "" when there are none.
 
-    Opt-in and codex-only. The alert an operator reads carries whatever the CLI
-    said, which for a timeout is only that it timed out; these say whether the
-    agent finished, where the time went, and whether the work ever started.
+    Opt-in. The alert an operator reads carries whatever the CLI said, which for
+    a timeout is only that it timed out; these say whether the agent finished,
+    where the time went, and whether the work ever started.
 
     The backend comes from the job's own resolved profile, not the daemon's
     global config: an entry running a profile that switched backends would
-    otherwise be diagnosed against a transcript format it never wrote.
+    otherwise be diagnosed against a transcript format it never wrote. A backend
+    with no reader gets no signals rather than a guess.
 
     Guarded whole: a diagnosis is a courtesy on a path that is already failing,
     so a broken read must not replace the real error with its own traceback.
     """
     if settings.get("JOBS_DIAGNOSE_FAILURES", "").lower() not in {"1", "true", "yes"}:
         return ""
-    if profile.backend != "codex":
-        return ""
     try:
-        signals = transcript.diagnose_codex(
-            workspace, session_uuid, prompt=prompt, timeout_s=timeout
+        signals = transcript.diagnose(
+            profile.backend, workspace, session_uuid, prompt=prompt, timeout_s=timeout
         )
     except Exception:
         logger.exception("jobs: could not diagnose the failed run")
