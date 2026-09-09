@@ -2512,9 +2512,10 @@ class TestCodexInAPane:
         assert returncode == -1
         assert "boom-detail" in detail
 
-    async def test_tmux_refusing_to_host_is_a_failure_with_its_reason(
-        self, tmp_path: Path
+    async def test_tmux_refusing_to_host_runs_the_turn_unhosted(
+        self, tmp_path: Path, caplog
     ):
+        """A refusal is not a failed turn: `codex exec` still answers it."""
         from claude_on_the_fly import tmux as tmux_mod
 
         pane = self._pane(tmp_path)
@@ -2523,7 +2524,8 @@ class TestCodexInAPane:
         proc.communicate = AsyncMock(return_value=(b"", b"duplicate session"))
         with (
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            pytest.raises(RuntimeError, match="duplicate session"),
+            caplog.at_level(logging.WARNING),
+            pytest.raises(codex_mod._PaneUnavailable),
         ):  # new-session fails before the landing check, so alive is never asked
             await codex_mod._run_codex_in_pane(
                 pane,
@@ -2533,7 +2535,130 @@ class TestCodexInAPane:
                 self._follower(tmp_path),
                 timeout=5,
             )
+        assert "duplicate session" in caplog.text
         tmux_mod.kill(pane)
+
+    async def test_a_long_prompt_stays_off_the_tmux_command_line(self, tmp_path: Path):
+        """tmux packs its whole argv into one imsg and refuses over 16KB, so the
+        prompt rides in a file the pane reads instead."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        prompt = "x" * 100_000
+        seen: dict[str, tuple] = {}
+
+        async def capture(*argv, **_kwargs):
+            seen.setdefault("create", argv)
+            proc = MagicMock()
+            proc.returncode = 1
+            proc.communicate = AsyncMock(return_value=(b"", b"stop here"))
+            return proc
+
+        with (
+            patch("asyncio.create_subprocess_exec", capture),
+            pytest.raises(codex_mod._PaneUnavailable),
+        ):
+            await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", prompt],
+                tmp_path,
+                dict(os.environ),
+                self._follower(tmp_path),
+                timeout=5,
+            )
+
+        packed = sum(len(arg.encode()) + 1 for arg in seen["create"])
+        assert packed < 16_384
+        tmux_mod.kill(pane)
+
+    @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+    async def test_the_pane_gets_the_prompt_byte_for_byte(self, tmp_path: Path):
+        """The point of the file is that codex still receives what it was given."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        prompt = "long \U0001f600 prompt\n" * 3000 + "  trailing space \n\n"
+        landed = tmp_path / "landed.txt"
+        follower = self._follower(tmp_path)
+        try:
+            task = asyncio.create_task(
+                codex_mod._run_codex_in_pane(
+                    pane,
+                    [
+                        "/bin/sh",
+                        "-c",
+                        f'printf %s "$1" > {landed}; sleep 60',
+                        "sh",
+                        prompt,
+                    ],
+                    tmp_path,
+                    {**os.environ, **pane.env},
+                    follower,
+                    timeout=30,
+                )
+            )
+            await asyncio.sleep(2)
+            follower.turn_completed.set()
+            await asyncio.wait_for(task, timeout=10)
+        finally:
+            tmux_mod.kill(pane)
+
+        assert landed.read_text() == prompt
+
+    @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+    async def test_the_turns_scratch_files_go_with_the_turn(self, tmp_path: Path):
+        """The env file holds a broker token and the script holds the prompt, and
+        the tap file would otherwise explain one turn with an older turn's rows."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        follower = self._follower(tmp_path)
+        try:
+            task = asyncio.create_task(
+                codex_mod._run_codex_in_pane(
+                    pane,
+                    ["/bin/sh", "-c", "echo drawing; sleep 60"],
+                    tmp_path,
+                    {**os.environ, **pane.env, "COTF_CMD_TOKEN": "secret"},
+                    follower,
+                    timeout=30,
+                )
+            )
+            await asyncio.sleep(2)
+            assert tmux_mod.turn_file(pane.session, "sh").is_file()
+            follower.turn_completed.set()
+            await asyncio.wait_for(task, timeout=10)
+        finally:
+            tmux_mod.kill(pane)
+
+        for suffix in ("env", "sh", "out"):
+            assert not tmux_mod.turn_file(pane.session, suffix).exists()
+
+    async def test_a_script_that_cannot_be_staged_runs_unhosted(
+        self, tmp_path: Path, caplog
+    ):
+        """No script, no pane -- and the env file it would have sourced goes too,
+        rather than sitting there with this turn's broker token in it."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        with (
+            patch.object(
+                codex_mod, "_write_pane_script", side_effect=OSError("read-only")
+            ),
+            caplog.at_level(logging.WARNING),
+            pytest.raises(codex_mod._PaneUnavailable),
+        ):
+            await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", "p"],
+                tmp_path,
+                {**os.environ, "COTF_CMD_TOKEN": "secret"},
+                self._follower(tmp_path),
+                timeout=5,
+            )
+        assert "could not stage the pane script" in caplog.text
+        assert not tmux_mod.turn_file(pane.session, "env").exists()
 
     async def test_a_hosted_run_that_overruns_names_the_limit(self, tmp_path: Path):
         from claude_on_the_fly import tmux as tmux_mod
@@ -2641,6 +2766,44 @@ class TestHostingIsChosenFromTheEnvironment:
         # The hosted arm runs the interactive binary, never `codex exec`.
         assert "exec" not in seen["argv"]
         assert out["body"] == "hosted"
+
+    async def test_a_pane_that_cannot_be_built_falls_back_to_the_plain_arm(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Losing the mirror must not cost the reply."""
+        taken: list[str] = []
+
+        async def fake_pane_arm(*_a, **_k):
+            raise codex_mod._PaneUnavailable
+
+        async def fake_plain(wrapped, workspace, env, follower, timeout):
+            taken.append("plain")
+            return 0, ""
+
+        monkeypatch.setattr(codex_mod, "_run_codex_in_pane", fake_pane_arm)
+        monkeypatch.setattr(codex_mod, "_run_codex_plain", fake_plain)
+        monkeypatch.setattr(
+            codex_mod.sandbox,
+            "agent_env",
+            lambda: {
+                "TMUX_TMPDIR": str(tmp_path / "sock"),
+                "CLAUDE_PTY_TMUX_SESSION": "cotf-chat-9",
+            },
+        )
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(_rollout_text(_task_complete("fell back")))
+        with patch.object(
+            codex_mod.transcript, "_find_codex_rollout_by_cwd", lambda _c, **_k: rollout
+        ):
+            out = await codex_mod._run_codex_exec(
+                tmp_path,
+                ["codex", "exec", "p"],
+                None,
+                interactive=["codex", "the prompt"],
+            )
+
+        assert taken == ["plain"]
+        assert out["body"] == "fell back"
 
     async def test_an_unhosted_run_takes_the_plain_arm(
         self, tmp_path: Path, monkeypatch
@@ -2774,13 +2937,22 @@ class TestRolloutFollowerEdges:
 
 
 class TestPaneArmEdges:
+    @pytest.fixture(autouse=True)
+    def _own_socket(self, monkeypatch):
+        """Held for the whole test, not just while the pane is built: the turn's
+        scratch files are written under this root while the turn runs."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        root = Path(tempfile.mkdtemp(prefix="cotf-t-"))
+        monkeypatch.setattr(tmux_mod, "panes_root", lambda: root)
+        yield root
+        shutil.rmtree(root, ignore_errors=True)
+
     @staticmethod
     def _pane(tmp_path: Path):
         from claude_on_the_fly import tmux as tmux_mod
 
-        root = Path(tempfile.mkdtemp(prefix="cotf-t-"))
-        with patch.object(tmux_mod, "panes_root", lambda: root):
-            return tmux_mod.pane_for("cotf-job-edges")
+        return tmux_mod.pane_for("cotf-job-edges")
 
     async def test_a_failed_tap_costs_the_detail_but_not_the_run(
         self, tmp_path: Path, caplog
@@ -2829,6 +3001,44 @@ class TestPaneArmEdges:
         self, tmp_path: Path
     ):
         assert codex_mod._pane_output_tail(tmp_path / "never-written") == ""
+
+    def test_an_env_that_cannot_be_staged_costs_the_env_not_the_pane(
+        self, tmp_path: Path, caplog
+    ):
+        """The pane still runs; it runs with whatever the server inherited."""
+        with caplog.at_level(logging.WARNING, logger=codex_mod.__name__):
+            staged = codex_mod._pane_env_file(
+                {"COTF_CMD_TOKEN": "secret"}, tmp_path / "nowhere" / "pane.env"
+            )
+        assert staged is None
+        assert "could not stage the pane env" in caplog.text
+
+    async def test_a_session_that_lands_elsewhere_runs_unhosted(
+        self, tmp_path: Path, caplog
+    ):
+        """`new-session` reports success for a session it created on another
+        server, so the landing check asks the address we will poll."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        created = MagicMock()
+        created.returncode = 0
+        created.communicate = AsyncMock(return_value=(b"", b""))
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=created)),
+            patch.object(tmux_mod, "alive", lambda _p: False),
+            caplog.at_level(logging.WARNING, logger=codex_mod.__name__),
+            pytest.raises(codex_mod._PaneUnavailable),
+        ):
+            await codex_mod._run_codex_in_pane(
+                pane,
+                ["codex", "p"],
+                tmp_path,
+                dict(os.environ),
+                codex_mod._RolloutFollower(tmp_path, None, None),
+                timeout=None,
+            )
+        assert "did not land on" in caplog.text
 
 
 class TestCodexPtyMode:
@@ -2929,6 +3139,8 @@ class TestHostedTurnCleanup:
         from claude_on_the_fly import tmux as tmux_mod
 
         killed: list[str] = []
+        root = Path(tempfile.mkdtemp(prefix="cotf-t-"))
+        monkeypatch.setattr(tmux_mod, "panes_root", lambda: root)
         monkeypatch.setattr(tmux_mod, "kill", lambda p: killed.append(p.session))
         monkeypatch.setattr(tmux_mod, "alive", lambda _p: True)
         pane = tmux_mod.Pane(session="cotf-job-retry")
