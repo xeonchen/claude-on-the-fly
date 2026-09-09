@@ -356,6 +356,22 @@ def test_ensure_root_refuses_an_address_too_long_for_a_unix_socket(
     assert not deep.exists()
 
 
+def test_ensure_root_reports_a_root_it_cannot_create(
+    monkeypatch: pytest.MonkeyPatch,
+    short_panes_root: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """An unusable root costs the mirror, never the turn."""
+    blocked = short_panes_root / "a-file"
+    blocked.write_text("")
+    monkeypatch.setattr(tmux, "panes_root", lambda: blocked / "panes")
+
+    with caplog.at_level("WARNING"):
+        assert tmux.ensure_root() is False
+
+    assert "could not create" in caplog.text
+
+
 def test_pane_for_declines_when_the_address_is_unusable(
     monkeypatch: pytest.MonkeyPatch,
 ):

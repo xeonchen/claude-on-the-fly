@@ -144,10 +144,22 @@ Three consequences:
 - **Autonomy is `--dangerously-bypass-approvals-and-sandbox`**, not `--yolo`. That is the
   spelling both the interactive entry point and `resume` document; `--yolo` is
   undocumented on `resume`.
+- **Nothing about the turn rides on the tmux command line.** A tmux client packs its
+  whole argv into one imsg and answers `command too long` over 16KB — measured on tmux
+  3.7c, 16300 bytes went through and 16400 did not. The prompt is the argument that
+  crosses that line: a first codex turn carries the system prompt and the claude handoff
+  before the user types a word. So the pane's whole shell script, prompt included, is
+  written to `<session>.sh` under the panes root and tmux is asked to run `bash <file>`.
+  The turn's three scratch files — `<session>.env` (the curated environment, which holds
+  the broker token), `<session>.sh`, and `<session>.out` (the `pipe-pane` tap) — are
+  0600, daemon-owned, and deleted when the turn ends, whichever way it ends.
 
 `native` mode and any pty-mode turn that has no pane still run `codex exec`, and every
 arm reads the turn from the rollout through one parser, so they cannot report it
-differently.
+differently. Every way the pane can fail to be built — tmux refusing the session, the
+session landing on another server, a script that cannot be staged — takes that same
+fallback rather than the turn. A pane is a mirror, and losing the mirror must not cost
+the reply.
 
 The mode is separate from `agent.pane` on purpose. `pane` is global, so using it to
 retreat from a break in codex's interactive path would take claude-pty's mirror away
