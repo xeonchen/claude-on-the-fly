@@ -26,6 +26,7 @@ os.environ["USERPROFILE"] = _TEST_HOME
 # now always set, so the `Path.home() / ".claude"` fallback is never taken here:
 # a test covering that branch has to delenv it first.
 os.environ["CLAUDE_CONFIG_DIR"] = str(Path(_TEST_HOME) / ".claude")
+os.environ["CODEX_HOME"] = str(Path(_TEST_HOME) / ".codex")
 atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
 
 import json  # noqa: E402

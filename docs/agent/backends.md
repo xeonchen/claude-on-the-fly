@@ -203,3 +203,13 @@ Both modes report prompt size and window size, which is what the auto-compact ga
 - `ensure_persona()` in `agent.py` symlinks a persona into every workspace as both `CLAUDE.md` (for claude) and `AGENTS.md` (for codex) — see `PERSONA_FILENAMES`. The source is `~/.claude-on-the-fly/CLAUDE.md` unless the caller resolved a per-chat one through `agent.persona_for` (Slack channel, Telegram chat, or job key) through its `personas:` table.
 - `transcript.py` handles cross-backend handoff: when the daemon switches backends, it parses the prior backend's session JSONL into a single prompt so context carries over. If you're changing session-log paths or output schemas in a backend, this is the file that will break.
 - `remove_workspace_sessions()` deletes the session directory claude keys to a workspace path but keeps *outside* it (`~/.claude/projects/<hash>/`) and removes matching Codex mappings from the daemon-owned store.
+
+### Direct Codex diagnostic output
+
+The direct `codex exec` subprocess writes its final reply to stdout and ongoing
+narration (including tool output) to stderr. Keep the final reply subject to the
+shared 8 MiB cap, but drain stderr continuously and retain only its last 64 KiB
+for exit diagnostics. Cumulative narration is not a response-size violation.
+The rollout remains the durable execution record. Both readers must be cancelled
+and awaited when the turn is cancelled or the stdout cap is exceeded, so a
+surviving descendant holding a pipe cannot strand the reader tasks.

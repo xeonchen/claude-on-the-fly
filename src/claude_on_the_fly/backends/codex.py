@@ -561,13 +561,62 @@ def _ensure_workspace_trusted(workspace: Path, codex_home: Path) -> None:
     logger.debug("codex: trusted %s for the interactive pane", real)
 
 
+# Narration includes tool output and can grow throughout a long report run.
+# The rollout is the durable record; retain only enough diagnostics for errors.
+_DIAGNOSTIC_TAIL_BYTES = 64 * 1024
+
+
+async def _read_diagnostic_tail(stream: asyncio.StreamReader) -> bytes:
+    tail = bytearray()
+    while chunk := await stream.read(64 * 1024):
+        tail.extend(chunk)
+        del tail[:-_DIAGNOSTIC_TAIL_BYTES]
+    return bytes(tail)
+
+
+async def _communicate_plain(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    """Cap the final reply while draining narration with bounded memory."""
+    stdout_stream = getattr(proc, "stdout", None)
+    stderr_stream = getattr(proc, "stderr", None)
+    if not isinstance(stdout_stream, asyncio.StreamReader) or not isinstance(
+        stderr_stream, asyncio.StreamReader
+    ):
+        # Embedders and lightweight test processes may only offer communicate.
+        stdout, stderr = await proc.communicate()
+        stderr = stderr[-_DIAGNOSTIC_TAIL_BYTES:]
+    else:
+        stdout_task = asyncio.create_task(agent._read_to_eof_capped(stdout_stream))
+        stderr_task = asyncio.create_task(_read_diagnostic_tail(stderr_stream))
+        try:
+            # Both readers run concurrently: narration must never fill its pipe
+            # while we await the final reply. Check its cap before awaiting EOF
+            # on stderr, which may still be held by a descendant.
+            stdout = await stdout_task
+            if len(stdout) > agent.MAX_AGENT_OUTPUT_BYTES:
+                await agent._kill_process_tree(proc)
+                raise agent.AgentOutputLimitError(
+                    f"agent stdout exceeded {agent.MAX_AGENT_OUTPUT_BYTES} bytes"
+                )
+            stderr = await stderr_task
+        finally:
+            stdout_task.cancel()
+            stderr_task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    if len(stdout) > agent.MAX_AGENT_OUTPUT_BYTES:
+        await agent._kill_process_tree(proc)
+        raise agent.AgentOutputLimitError(
+            f"agent stdout exceeded {agent.MAX_AGENT_OUTPUT_BYTES} bytes"
+        )
+    return stdout, stderr
+
+
 async def _wait_for_exit(
     proc: asyncio.subprocess.Process, follower: _RolloutFollower
 ) -> tuple[bytes, bytes]:
     """Collect codex's output, without being held hostage by a codex that won't exit."""
     watchdog = asyncio.create_task(_kill_once_quiet_after_turn(proc, follower))
     try:
-        return await agent.communicate_capped(proc)
+        return await _communicate_plain(proc)
     finally:
         watchdog.cancel()
 

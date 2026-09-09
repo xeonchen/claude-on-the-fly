@@ -3072,3 +3072,65 @@ class TestEffortReachesTheInteractiveArgv:
         hosted_argv = backend._interactive_argv(tmp_path, None, "hi")
         flag = 'model_reasoning_effort="xhigh"'
         assert flag in exec_argv and flag in hosted_argv
+
+
+class TestPlainDiagnosticCapture:
+    async def test_more_than_eight_mib_narration_preserves_success(self, tmp_path):
+        proc = _streamed_proc(
+            0,
+            _stream(b"done"),
+            _stream(b"x" * (codex_mod.agent.MAX_AGENT_OUTPUT_BYTES + 1)),
+        )
+        result = await _run_exec(proc, tmp_path, records=(_task_complete("done"),))
+        assert result["body"] == "done"
+
+    async def test_diagnostics_retain_only_error_tail(self):
+        ending = b"fatal: useful final diagnostic"
+        proc = _streamed_proc(
+            1,
+            _stream(),
+            _stream(b"x" * (codex_mod.agent.MAX_AGENT_OUTPUT_BYTES + 1) + ending),
+        )
+        stdout, stderr = await codex_mod._communicate_plain(proc)
+        assert stdout == b""
+        assert len(stderr) == codex_mod._DIAGNOSTIC_TAIL_BYTES
+        assert stderr.endswith(ending)
+
+    @pytest.mark.parametrize("streamed", [False, True])
+    async def test_final_reply_cap_kills_without_waiting_for_stderr(self, streamed):
+        output = b"x" * (codex_mod.agent.MAX_AGENT_OUTPUT_BYTES + 1)
+        proc = (
+            _streamed_proc(0, _stream(output), _stream(eof=False))
+            if streamed
+            else _exec_proc(0, stdout=output)
+        )
+        with (
+            patch.object(codex_mod.agent, "_kill_process_tree", AsyncMock()) as kill,
+            pytest.raises(codex_mod.agent.AgentOutputLimitError, match="stdout"),
+        ):
+            await asyncio.wait_for(codex_mod._communicate_plain(proc), timeout=2)
+        kill.assert_awaited_once_with(proc)
+
+    async def test_cancellation_reaps_both_readers(self):
+        stdout, stderr = _stream(eof=False), _stream(eof=False)
+        proc = _streamed_proc(0, stdout, stderr)
+        task = asyncio.create_task(codex_mod._communicate_plain(proc))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        stdout.feed_eof()
+        stderr.feed_eof()
+        assert await stdout.read() == b""
+        assert await stderr.read() == b""
+
+    async def test_communicate_only_embedder(self):
+        class Process:
+            async def communicate(self):
+                return b"reply", b"diagnostic"
+
+        assert await codex_mod._communicate_plain(Process()) == (
+            b"reply",
+            b"diagnostic",
+        )
