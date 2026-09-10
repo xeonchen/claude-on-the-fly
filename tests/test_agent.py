@@ -1732,6 +1732,31 @@ class TestEnsurePersona:
         assert not (workspace / "CLAUDE.md").exists()
         assert not (workspace / "AGENTS.md").is_symlink()
 
+    def test_a_stale_link_through_a_symlinked_personas_dir_is_removed(
+        self, tmp_path: Path
+    ) -> None:
+        """The binding was removed while personas/ was a link to somewhere else.
+        Judging ownership by the resolved target would call the link somebody
+        else's and leave the chat running a persona nothing configures."""
+        data_root = tmp_path / "cotf-data"
+        data_root.mkdir()
+        source = tmp_path / "elsewhere" / "personas"
+        source.mkdir(parents=True)
+        persona = source / "old.md"
+        persona.write_text("retired")
+        (data_root / "personas").symlink_to(source)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with patch("claude_on_the_fly.agent.DATA_DIR", data_root):
+            ensure_persona(workspace, data_root / "personas" / "old.md")
+            assert (workspace / "CLAUDE.md").is_symlink()
+            persona.unlink()
+            ensure_persona(workspace)
+
+        assert not (workspace / "CLAUDE.md").is_symlink()
+        assert not (workspace / "AGENTS.md").is_symlink()
+
     def test_a_real_file_is_left_alone_when_nothing_resolves(
         self, tmp_path: Path
     ) -> None:
@@ -1870,6 +1895,67 @@ class TestPersonaFor:
         with caplog.at_level(logging.ERROR):
             assert persona_for("slack", ("C07ABCDEF",)) is None
         assert "escapes" in caplog.text
+
+    def test_a_symlinked_personas_directory_is_followed(
+        self, operator_settings: Path, tmp_path: Path
+    ) -> None:
+        """The operator keeps personas in a version-controlled directory elsewhere
+        and links it in. Resolving the leaf would put every entry outside the data
+        root and drop the chat to the global persona."""
+        source = tmp_path / "elsewhere" / "personas"
+        source.mkdir(parents=True)
+        (source / "oncall.md").write_text("# oncall")
+        (operator_settings.parent / "personas").symlink_to(source)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/oncall.md\n"
+        )
+        found = persona_for("slack", ("C07ABCDEF",))
+        assert found is not None
+        assert found.read_text() == "# oncall"
+
+    def test_a_symlinked_persona_file_is_followed(
+        self, operator_settings: Path, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "elsewhere" / "oncall.md"
+        outside.parent.mkdir(parents=True)
+        outside.write_text("# oncall")
+        link = operator_settings.parent / "personas" / "oncall.md"
+        link.parent.mkdir(exist_ok=True)
+        link.symlink_to(outside)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/oncall.md\n"
+        )
+        found = persona_for("slack", ("C07ABCDEF",))
+        assert found is not None
+        assert found.read_text() == "# oncall"
+
+    def test_a_symlink_does_not_reopen_dot_dot_traversal(
+        self, operator_settings: Path, caplog
+    ) -> None:
+        """Following symlinks is the new behavior; collapsing `..` is the old
+        containment property, and it still holds."""
+        outside = operator_settings.parent.parent / "elsewhere.md"
+        outside.write_text("someone else's file")
+        (operator_settings.parent / "personas").mkdir(exist_ok=True)
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/../../elsewhere.md\n"
+        )
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "escapes" in caplog.text
+
+    def test_a_dangling_symlink_is_reported_as_missing(
+        self, operator_settings: Path, tmp_path: Path, caplog
+    ) -> None:
+        link = operator_settings.parent / "personas" / "oncall.md"
+        link.parent.mkdir(exist_ok=True)
+        link.symlink_to(tmp_path / "never-created.md")
+        operator_settings.write_text(
+            "slack:\n  personas:\n    C07ABCDEF: personas/oncall.md\n"
+        )
+        with caplog.at_level(logging.ERROR):
+            assert persona_for("slack", ("C07ABCDEF",)) is None
+        assert "does not exist" in caplog.text
 
     def test_a_non_string_value_is_refused(
         self, operator_settings: Path, caplog
