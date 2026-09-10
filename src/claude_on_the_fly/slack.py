@@ -1195,10 +1195,6 @@ class SlackFrontend(Frontend):
         # session -> monotonic time the notice can no longer be deferred past.
         # Held across reschedules, which is what bounds the debounce.
         self._gate_deadlines: dict[int, float] = {}
-        # (session, user) pairs already told that a channel needs an @mention.
-        # Per person, not per thread: two people can each tag, each forget, and
-        # each deserve one telling.
-        self._mention_hinted: set[tuple[int, str]] = set()
         # session -> everyone who has tagged the bot in that thread. A set rather
         # than the last one: a later tagger must not silently take over an earlier
         # tagger's claim. See `_hint_mention_required`.
@@ -1458,8 +1454,6 @@ class SlackFrontend(Frontend):
         self._reply_counts.pop(session_id, None)
         self._cancel_gate_notice(session_id)
         self._cancel_thread_mention_notices(session_id)
-        for key in [k for k in self._mention_hinted if k[0] == session_id]:
-            self._mention_hinted.discard(key)
         self._mention_taggers.pop(session_id, None)
         self._pending_msg.pop(session_id, None)
         self._pending_reply_suppressed.pop(session_id, None)
@@ -2645,8 +2639,8 @@ class SlackFrontend(Frontend):
     async def _hint_mention_required(
         self, channel: str, thread_ts: str | None, sender_id: str
     ) -> None:
-        """Say once, in a thread the bot is already in, that a channel message
-        without a tag is invisible to it.
+        """Say, in a thread the bot is already in, that a channel message without
+        a tag is invisible to it.
 
         Scoped to threads with a live session because those are the ones where
         somebody is talking *to* the bot and the missing tag is a slip. Without
@@ -2661,11 +2655,18 @@ class SlackFrontend(Frontend):
         app, unreadable. Only an untagged message from somebody who tagged in this
         thread is a plausible slip.
 
-        Everyone who tagged counts, and each is told at most once. Two people can
-        be mid-conversation with the bot in one thread, and both can forget; the
-        one who tagged more recently has no better claim to the reminder than the
-        other. So the tagger set only grows, and `_mention_hinted` is keyed by
-        person rather than by thread.
+        Everyone who tagged counts. Two people can be mid-conversation with the
+        bot in one thread, and both can forget; the one who tagged more recently
+        has no better claim to the reminder than the other. So the tagger set only
+        grows.
+
+        Each slip is told, not only the first. A reminder that gets used up leaves
+        the next slip unanswered in a thread the person believes the bot is
+        reading, and that thread just stalls. The delay below is what keeps the
+        repeats quiet: a burst of untagged messages still collapses into one.
+        That makes the delay the only cap on volume, and the cost is deliberate:
+        somebody who tagged and then keeps chatting in the thread untagged is
+        told after every pause.
 
         Posted as an ephemeral message, so only the person who forgot sees it.
         The thread stays clean for everyone else, which matters because this fires
@@ -2689,8 +2690,6 @@ class SlackFrontend(Frontend):
             return
         session_id = _session_key(channel, thread_ts)
         if session_id not in self._sessions:
-            return
-        if (session_id, sender_id) in self._mention_hinted:
             return
         if sender_id not in self._mention_taggers.get(session_id, frozenset()):
             logger.debug(
@@ -2730,7 +2729,6 @@ class SlackFrontend(Frontend):
         # not leave a task that wakes minutes later and posts anyway.
         try:
             await asyncio.sleep(delay)
-            self._mention_hinted.add((session_id, sender_id))
         finally:
             # Deregister before posting, for the same reason the gate notice
             # does: a cancel landing inside `chat_postMessage` aborts a half-sent

@@ -1709,7 +1709,6 @@ class TestNoticeToggles:
         )
 
         assert not frontend._mention_notices
-        assert not frontend._mention_hinted
         frontend._app.client.chat_postMessage.assert_not_called()
         frontend._on_message.assert_not_awaited()
 
@@ -1744,7 +1743,7 @@ class TestNoticeToggles:
 
 
 class TestMentionNotice:
-    """One notice, and only for somebody who forgot the tag *and* left. While they
+    """A notice for each slip, and only for somebody who forgot the tag *and* left. While they
     are still typing they are still watching, and a notice read on arrival is one
     they never register."""
 
@@ -1783,7 +1782,6 @@ class TestMentionNotice:
         assert "<@U_SELF>" in sent["text"]  # and it names the tag to use
         # Cosmetic, not a ping: an ephemeral message cannot notify anyone.
         assert sent["text"].startswith("<@U_ALLOWED> ")
-        assert (session_id, "U_ALLOWED") in frontend._mention_hinted
         # Never the public form: the whole point is that the thread stays clean.
         frontend._app.client.chat_postMessage.assert_not_called()
         frontend._on_message.assert_not_awaited()
@@ -1835,22 +1833,34 @@ class TestMentionNotice:
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert not frontend._mention_notices
-        assert (
-            session_id,
-            "U_ALLOWED",
-        ) not in frontend._mention_hinted  # still tellable later
         frontend._on_message.assert_awaited_once()
 
-    async def test_it_is_said_once_per_thread(self, frontend, monkeypatch):
+    async def test_it_is_said_every_time_they_forget(self, frontend, monkeypatch):
+        """A reminder that stops after the first one leaves the next slip sitting
+        unanswered in a thread the person thinks the bot is reading. The delay is
+        what keeps this quiet: a burst of untagged messages still gets one."""
         monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
         session_id = self._live_thread(frontend)
 
         await frontend._ingest_event(self._event("t2"))
         await frontend._mention_notices[session_id, "U_ALLOWED"]
         await frontend._ingest_event(self._event("t3", "still forgetting"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
 
-        assert not frontend._mention_notices
-        assert frontend._app.client.chat_postEphemeral.call_count == 1
+        assert frontend._app.client.chat_postEphemeral.call_count == 2
+
+    async def test_a_later_slip_after_a_tag_is_said_again(self, frontend, monkeypatch):
+        """Tagging correctly in between does not use the reminder up either."""
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
+        session_id = self._live_thread(frontend)
+
+        await frontend._ingest_event(self._event("t2"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
+        await frontend._ingest_event(self._event("t3", "<@U_SELF> this one tagged"))
+        await frontend._ingest_event(self._event("t4", "forgot again"))
+        await frontend._mention_notices[session_id, "U_ALLOWED"]
+
+        assert frontend._app.client.chat_postEphemeral.call_count == 2
 
     async def test_a_thread_the_bot_is_not_in_gets_nothing(self, frontend, monkeypatch):
         """Ordinary channel chatter. Answering it would make the bot talk in
@@ -1900,7 +1910,7 @@ class TestMentionNotice:
         await frontend._ingest_event(self._event("t2"))
         await frontend._mention_notices[session_id, "U_ALLOWED"]
 
-        assert (session_id, "U_ALLOWED") in frontend._mention_hinted
+        frontend._app.client.chat_postEphemeral.assert_awaited_once()
 
     async def test_only_the_person_who_tagged_is_nudged(self, frontend, monkeypatch):
         """A thread the bot was pulled into still carries other conversations.
@@ -1995,9 +2005,9 @@ class TestMentionNoticePerPerson:
         ]
         assert told == ["U_ALICE", "U_BOB"]
 
-    async def test_each_is_told_only_once(self, frontend, monkeypatch):
-        """Once-only is per person now. Alice having been told must not consume
-        Bob's telling, and must not earn her a second one."""
+    async def test_each_is_told_on_every_slip(self, frontend, monkeypatch):
+        """Alice being told again does not use up Bob's telling, and Bob still
+        gets his own."""
         monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
         session_id = self._two_taggers(frontend)
         await frontend._ingest_event(self._event("t1", "U_ALICE", "<@U_SELF> hi"))
@@ -2006,13 +2016,15 @@ class TestMentionNoticePerPerson:
         await frontend._ingest_event(self._event("t3", "U_ALICE"))
         await frontend._mention_notices[session_id, "U_ALICE"]
         await frontend._ingest_event(self._event("t4", "U_ALICE", "still nothing?"))
-
-        assert not frontend._mention_notices
-        assert frontend._app.client.chat_postEphemeral.call_count == 1
-
+        await frontend._mention_notices[session_id, "U_ALICE"]
         await frontend._ingest_event(self._event("t5", "U_BOB"))
         await frontend._mention_notices[session_id, "U_BOB"]
-        assert frontend._app.client.chat_postEphemeral.call_count == 2
+
+        told = [
+            call.kwargs["user"]
+            for call in frontend._app.client.chat_postEphemeral.call_args_list
+        ]
+        assert told == ["U_ALICE", "U_ALICE", "U_BOB"]
 
     async def test_one_persons_tag_leaves_the_others_notice_pending(
         self, frontend, monkeypatch
@@ -2069,22 +2081,6 @@ class TestMentionNoticePerPerson:
                 await task
         assert not frontend._mention_notices
         assert session_id not in frontend._mention_taggers
-
-    async def test_eviction_clears_the_told_record_for_everyone(
-        self, frontend, monkeypatch
-    ):
-        """`_mention_hinted` is keyed by person now, so eviction has to sweep the
-        thread's entries rather than discard one key."""
-        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 0.001)
-        session_id = self._two_taggers(frontend)
-        await frontend._ingest_event(self._event("t1", "U_ALICE", "<@U_SELF> hi"))
-        await frontend._ingest_event(self._event("t2", "U_ALICE"))
-        await frontend._mention_notices[session_id, "U_ALICE"]
-        assert (session_id, "U_ALICE") in frontend._mention_hinted
-
-        frontend._forget_session(session_id)
-
-        assert not frontend._mention_hinted
 
 
 # ---------------------------------------------------------------------------
