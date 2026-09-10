@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -3168,3 +3169,88 @@ def test_the_daemon_state_write_deny_comes_after_the_project_write_allow():
     for suffix in ('"/.claude-on-the-fly/state"', '(param "_DATA_DIR") "/state"'):
         index = _rule_index(profile, "(deny file-write*", suffix)
         assert index > allow, f"the _PROJECT_DIR write allow re-opens state/ ({suffix})"
+
+
+# --- a dotenv inside an operator grant ---
+
+
+def test_the_profile_dotenv_regexes_have_no_end_anchor():
+    """Pinning an unstated behaviour the denies depend on.
+
+    `(.*/)?\\.env` with no `$` matches `.env` and everything starting with it:
+    `.env.local`, `.env.bak`, `.env.sync-conflict-...`. That is the shape a backup
+    or a syncer actually leaves, and the Linux half globs `.env*` to match. Adding
+    an end anchor here would look like tidying and would silently narrow every
+    dotenv deny in both profiles, so it is asserted rather than assumed.
+    """
+    for profile in (sandbox._DENY_MOST_PROFILE, sandbox._BASE_PROFILE):
+        text = profile.read_text()
+        for line in text.splitlines():
+            if "\\\\.env" in line and "deny file-read*" in line:
+                assert '\\\\.env")' in line or '\\\\.env"' in line, line
+                assert "\\\\.env$" not in line, f"end anchor narrows the deny: {line}"
+
+
+def test_deny_most_denies_a_dotenv_inside_an_operator_grant(monkeypatch, tmp_path):
+    """An `sandbox.extra_paths` entry is a subpath allow, so without this the token
+    file beside the files the operator wanted granted comes back readable."""
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("macOS only")
+    granted = tmp_path / "config-repo"
+    (granted / "skills" / "tool").mkdir(parents=True)
+    secret = granted / "skills" / "tool" / ".env"
+    secret.write_text("TOKEN=xoxp-not-a-real-token")
+    variant = granted / "skills" / "tool" / ".env.local"
+    variant.write_text("TOKEN=xoxp-not-a-real-token")
+    ordinary = granted / "skills" / "tool" / "run.sh"
+    ordinary.write_text("echo hello")
+
+    monkeypatch.setenv("COTF_SANDBOX", "jail")
+    monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", str(granted))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def read(path):
+        argv = sandbox.wrap(["/bin/cat", str(path)], workspace)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+    assert read(secret).returncode != 0, "the dotenv was readable inside the grant"
+    assert read(variant).returncode != 0, ".env.local was readable inside the grant"
+    # The control: the grant itself still works, so the test above is the deny
+    # firing rather than the whole tree being unreachable.
+    assert read(ordinary).returncode == 0, "the operator grant itself did not apply"
+
+
+def test_dotenv_sweep_finds_variants_and_prunes_heavy_directories(tmp_path):
+    (tmp_path / "sub").mkdir()
+    for name in (".env", ".env.local", ".env.sync-conflict-x"):
+        (tmp_path / "sub" / name).write_text("x")
+    (tmp_path / "sub" / "ordinary.txt").write_text("x")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / ".env").write_text("never descended into")
+
+    found = {path.name for path in sandbox._dotenvs_under([tmp_path])}
+    assert found == {".env", ".env.local", ".env.sync-conflict-x"}
+    assert all(".git" not in path.parts for path in sandbox._dotenvs_under([tmp_path]))
+
+
+def test_dotenv_sweep_refuses_a_grant_it_cannot_cover(tmp_path, caplog):
+    """A partial mask list fails open, which is the one direction a deny must never
+    fail. `extra_paths` may drop an entry and carry on because that only ever grants
+    less; this cannot."""
+    (tmp_path / "many").mkdir()
+    for index in range(sandbox._MAX_SWEPT_DOTENVS + 2):
+        (tmp_path / "many" / f".env.{index}").write_text("x")
+    with caplog.at_level(logging.ERROR), pytest.raises(sandbox._SweepTooBroad):
+        sandbox._dotenvs_under([tmp_path])
+    assert "refusing to mask a partial list" in caplog.text
+
+
+def test_linux_masked_covers_dotenvs_under_an_operator_grant(monkeypatch, tmp_path):
+    granted = tmp_path / "config-repo"
+    granted.mkdir()
+    secret = granted / ".env"
+    secret.write_text("TOKEN=xoxp-not-a-real-token")
+    monkeypatch.setenv("COTF_SANDBOX_EXTRA_PATHS", str(granted))
+    assert secret in sandbox._linux_masked(tmp_path / "data")

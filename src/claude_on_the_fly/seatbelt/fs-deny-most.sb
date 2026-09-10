@@ -145,6 +145,24 @@
 ;; _TMPDIR / _EXTRA_* allows above if the data dir ever sits under those.
 (deny file-read* (regex (string-append "^" (regex-quote (param "_DATA_DIR")) "/(.*/)?\\.env")))
 (deny file-read* (subpath (string-append (param "_DATA_DIR") "/logs")))
+;; An operator grant is a subpath allow, so it re-opens any dotenv inside the tree
+;; it names. `_extra_path_refusal` cannot catch this: it mirrors the profile's own
+;; read denies, and until now the profile had no rule for a dotenv outside the data
+;; dir. A directory an operator adds for real reasons (a config repo, a skills
+;; tree) is exactly where a token file sits beside the files they wanted granted.
+;;
+;; Scoped to the three grants rather than applied globally on purpose: a global
+;; dotenv deny would also cover `.env.example` and `.env.template` in the
+;; workspace, which are checked-in files a turn has every reason to read.
+;;
+;; The regex has no end anchor, and that is deliberate: it matches `.env` and
+;; everything that starts with it -- `.env.local`, `.env.backup`, and whatever a
+;; syncer drops beside it (`.env.sync-conflict-...`). Verified with sandbox-exec,
+;; and pinned by a test, because adding `$` here would look like tidying and would
+;; silently narrow every dotenv deny in both profiles.
+(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_1")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_2")) "/(.*/)?\\.env")))
+(deny file-read* (regex (string-append "^" (regex-quote (param "_EXTRA_3")) "/(.*/)?\\.env")))
 
 ;; -- Writes: identical allowlist to fs-allow-reads.sb --
 ;; Global Claude settings/hooks/plugins are read by future invocations, so a
