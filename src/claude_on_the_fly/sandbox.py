@@ -24,6 +24,7 @@ import logging
 import os
 import shutil
 import sys
+from collections.abc import Iterable
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -1296,6 +1297,13 @@ def _linux_masked(data_dir: Path) -> list[Path]:
     now. Glob rather than an exact name because the macOS regex is unanchored at
     the end and so already covers `.env.bak` and friends -- which is the shape a
     backup taken before an edit actually has.
+
+    An operator grant needs the same sweep for a sharper reason. `sandbox.extra_paths`
+    names a directory an operator added for real reasons, which is exactly where a
+    token file sits beside the files they wanted granted, and the grant is a
+    read-only bind over the whole tree. `_extra_path_refusal` does not catch it:
+    that check mirrors the profile's own read denies, which had no rule for a
+    dotenv outside the data dir.
     """
     masked: list[Path] = []
     auth_sock = os.environ.get("SSH_AUTH_SOCK")
@@ -1305,7 +1313,63 @@ def _linux_masked(data_dir: Path) -> list[Path]:
         base = data_dir / granted
         if base.is_dir():
             masked += sorted(base.rglob(".env*"))
+    masked += _dotenvs_under(Path(p) for p in _extra_read_paths(cap=None))
     return masked
+
+
+# Directories worth never descending into during the operator sweep. A grant is an
+# arbitrary tree rather than one cotf owns, so the walk has to be bounded or a spawn
+# pays for it: `.git` alone can hold tens of thousands of objects, and neither of
+# these ever holds a dotenv the operator meant to protect.
+_SWEEP_PRUNED = frozenset({".git", "node_modules", ".venv", "__pycache__"})
+
+# Enough to name every real token file in a config tree, small enough that a grant
+# pointed somewhere pathological fails loudly rather than hanging the spawn.
+_MAX_SWEPT_DOTENVS = 64
+
+
+def _dotenvs_under(roots: Iterable[Path]) -> list[Path]:
+    """Every `.env*` file beneath these trees, for masking on Linux.
+
+    `rglob` is not used here, unlike the data-dir sweep above: that walks a tree
+    cotf owns and keeps small, while these are the operator's own and can be a
+    whole repository. `os.walk` is pruned in place instead.
+
+    Symlinks are not followed. A grant is already realpath'd by `_extra_read_paths`,
+    and following links inside it would let one loop or wander back out of the tree
+    the operator actually named.
+    """
+    found: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for parent, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [name for name in dirnames if name not in _SWEEP_PRUNED]
+            found += [
+                Path(parent) / name for name in filenames if name.startswith(".env")
+            ]
+            if len(found) > _MAX_SWEPT_DOTENVS:
+                logger.error(
+                    "sandbox.extra_paths sweep found more than %d dotenv files under "
+                    "%s; refusing to mask a partial list, so the grant is not safe to "
+                    "use as written. Narrow the entry to the directory the agent "
+                    "actually needs.",
+                    _MAX_SWEPT_DOTENVS,
+                    root,
+                )
+                raise _SweepTooBroad(str(root))
+    return sorted(found)
+
+
+class _SweepTooBroad(RuntimeError):
+    """An `sandbox.extra_paths` entry holds more dotenvs than the sweep will mask.
+
+    Raised rather than truncated on purpose. A partial mask list fails open: the
+    operator believes the tree is covered while some of it is readable, which is
+    the failure mode a deny list must never have. `sandbox.extra_paths` itself can
+    drop a refused entry and carry on, because that direction only ever grants
+    less than asked.
+    """
 
 
 def _codex_protected(codex: Path) -> list[Path]:
