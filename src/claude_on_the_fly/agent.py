@@ -378,8 +378,18 @@ def _persona_path(platform: str, key: str, value: object) -> Path | None:
     # be reached through a symlink. An absolute value lands outside DATA_DIR and is
     # rejected here too: this file decides what instructions the agent runs under,
     # so it points at the operator's own data directory or nowhere.
+    #
+    # The candidate is normalized lexically rather than with `resolve()`, because
+    # `resolve()` conflates two jobs. Collapsing `..` is the containment property
+    # and is kept. Following symlinks is not, and doing it here made a symlinked
+    # `personas/` unusable: every entry resolved to wherever the link pointed,
+    # landed outside the root, and dropped its chat to the global persona with
+    # only a log line to say so. A symlink under the root is the operator's own
+    # indirection -- the same operator who chose the path -- so it is followed, by
+    # `is_file()` below, after containment has already been decided on the path
+    # they configured.
     root = DATA_DIR.resolve()
-    path = (DATA_DIR / value).resolve()
+    path = Path(os.path.normpath(root / value))
     if not path.is_relative_to(root):
         logger.error(
             "%s.personas: `%s` -> %s escapes %s; ignoring it, so this chat falls "
@@ -470,11 +480,25 @@ def ensure_persona(workspace: Path, source: Path | None = None) -> None:
 
 def _unlink_personas(workspace: Path) -> None:
     """Remove persona symlinks pointing into DATA_DIR. A real file at either name
-    is the agent's or the operator's own and is left alone."""
-    root = DATA_DIR.resolve()
+    is the agent's or the operator's own and is left alone.
+
+    Ownership is judged from where the link points, not from where that target
+    ends up. `resolve()` would follow a symlinked `personas/` out to its real
+    location, decide the link was somebody else's, and leave a chat on a persona
+    no config still names -- the exact stale link this function exists to remove.
+    """
+    # Both spellings of the data root, because the two writers disagree: a per-chat
+    # link is written from the resolved root by `_persona_path`, the global one from
+    # DATA_DIR as configured by `ensure_persona`. On a host where DATA_DIR is itself
+    # reached through a symlink (/var on macOS) those are different strings for the
+    # same directory, and checking only one of them would strand the other's links.
+    roots = {DATA_DIR.resolve(), Path(os.path.normpath(DATA_DIR))}
     for filename in PERSONA_FILENAMES:
         target = workspace / filename
-        if target.is_symlink() and target.resolve().is_relative_to(root):
+        if not target.is_symlink():
+            continue
+        pointed_at = Path(os.path.normpath(target.parent / os.readlink(target)))
+        if any(pointed_at.is_relative_to(root) for root in roots):
             target.unlink()
 
 
