@@ -193,8 +193,8 @@ to a model and is not a security boundary. Cron and background jobs remain ungat
 | `job_command` | string / `$job` | Prefix for background work; empty disables | Restart Slack |
 | `alert_target` | string / unset | Slack channel or DM id for cron/job failure alerts; unset disables alerts | Restart jobs and cron |
 | `session_cap` | positive integer / `1000` | Retained thread sessions; invalid uses default | Immediate |
-| `reply_soft_limit` | positive integer / `10` | Replies before `$continue` is required | Immediate |
-| `reply_limit_notice_seconds` | non-negative number / `0` | Seconds the `$continue` notice is held before posting, so it lands unread instead of being read on arrival by a sender who is about to leave; `0` posts it immediately | Immediate |
+| `reply_soft_limit` | positive integer / `10` | Turns admitted per thread before `$continue` is required; a turn counts when it reaches the agent, so messages queued behind a running one are counted too | Immediate |
+| `reply_limit_notice_seconds` | non-negative number / `0` | Seconds the `$continue` notice is held before posting, so it lands after the sender's burst rather than between two of their messages; `0` posts it immediately | Immediate |
 | `mention_notice_seconds` | non-negative number / `0` | Seconds an untagged channel message waits before the bot tells the sender, in an ephemeral message only they see, that it only sees messages tagging it; one notice per burst of untagged messages, once the sender has been quiet this long, with no limit on repeats (a sender who keeps chatting untagged after tagging gets one after each pause), and only for someone who has tagged the bot there; `0` disables the notice and records no per-thread state for it | Immediate |
 | `personas` | mapping / empty | Per-chat instructions file, replacing the data-root `CLAUDE.md`; keys are channel id, channel name, sender id, `dm`, or `default` | Immediate |
 
