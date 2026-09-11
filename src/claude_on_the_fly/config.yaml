@@ -427,7 +427,7 @@ slack:
   # Failure-alert target: a Slack channel or DM id. Unset = no alerts. Needs a restart.
   # alert_target: C0123456789
 
-  # Threads retained before LRU eviction, replies per thread before the $continue gate;
+  # Threads retained before LRU eviction, turns per thread before the $continue gate;
   # seconds a gate notice is held (0 posts now), seconds a "tag me" notice waits (0 = never).
   # session_cap: 1000
   # reply_soft_limit: 10

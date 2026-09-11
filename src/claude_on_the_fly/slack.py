@@ -55,9 +55,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Soft cap on agent replies per thread. Once reached, inbound messages are
+# Soft cap on turns admitted per thread. Once reached, inbound messages are
 # gated (no agent run) until the user sends CONTINUE_COMMAND, which resets the
-# counter.
+# counter. Counted where a message becomes a turn, not where a reply posts: a
+# reply lands when the agent finishes, so a count kept there lagged the queue
+# and two messages sent back to back both passed a thread already over budget.
 DEFAULT_REPLY_SOFT_LIMIT = 10
 CONTINUE_COMMAND = "$continue"
 # How long the gate notice is held before it is posted. Off by default: 0 posts
@@ -67,6 +69,12 @@ CONTINUE_COMMAND = "$continue"
 # on arrival, and they walk away with no unread badge believing the message is
 # being worked on. Waiting until they have gone makes it an unread thread reply.
 DEFAULT_REPLY_LIMIT_NOTICE_SECONDS = 0.0
+# Ceiling on the gated-message backlog a thread keeps. The Continue button
+# replays that backlog in order, so the events have to be held somewhere, and
+# this bounds what one thread can pin on somebody who keeps typing past the gate.
+# Past the cap the oldest gated message is dropped and never runs. Not an
+# operator setting: a card that replays fifty turns is not a resume.
+GATED_MSG_BACKLOG_MAX = 50
 # Ceiling on the debounce above, timed from the first gated message. Somebody
 # firing a message every three seconds would otherwise defer the notice for as
 # long as they kept typing, and never learn the thread is gated. Not an operator
@@ -407,16 +415,22 @@ RATE_LIMIT_RETRIES = 3
 # once per turn (at message-in); ticks just index into it by elapsed time.
 STATUS_VERB_ROTATE_SECS = 4
 
-# One reaction per state of a message, and three distinct states. Named rather
-# than written inline at six call sites, because the failure mode is two states
+# One reaction per state of a message, and four distinct states. Named rather
+# than written inline at each call site, because the failure mode is two states
 # sharing a glyph: an interrupted turn wearing the queue's hourglass cannot be
 # told from one that is merely waiting its turn.
 #
 # `arrows_counterclockwise` for interrupted, because the cause is a restart and
 # the recovery is automatic, which is exactly what it says.
+#
+# `lock` for gated, because the thread is closed to new turns until somebody
+# resumes it. It must not be `eyes`: a gated message never runs, and eyes on it
+# would say the work is in progress, which is the one thing the gate notice
+# exists to deny.
 QUEUED_EMOJI = "hourglass_flowing_sand"
 RUNNING_EMOJI = "eyes"
 INTERRUPTED_EMOJI = "arrows_counterclockwise"
+GATED_EMOJI = "lock"
 
 _DOWNLOAD_CHUNK = 64 * 1024
 
@@ -730,6 +744,61 @@ def _build_response_blocks(body: str, response: Response) -> list[dict]:
             {"type": "context", "elements": [{"type": "mrkdwn", "text": tools}]}
         )
     return blocks
+
+
+CONTINUE_ACTION_ID = "cotf-continue"
+
+
+def _continue_button_value(channel: str, thread_ts: str | None) -> str:
+    """Routing for the gate notice's button: the thread it resumes.
+
+    Carried in the button `value` rather than derived from the tap's `message`
+    field. Whether an ephemeral message's block_actions payload carries
+    `thread_ts` is not something this code has verified, and deriving it wrong
+    resumes the wrong session. Two ids, nothing secret, and the tap survives a
+    restart for the same reason `_session_id_for` gives.
+    """
+    return f"{channel}|{thread_ts or ''}"
+
+
+def _parse_continue_value(value: str) -> tuple[str, str | None] | None:
+    """Split a button `value` back into (channel, thread_ts). None if malformed.
+
+    A card outlives the process that drew it, so this parses what a previous
+    build may have written. Anything that is not two fields is dropped by the
+    caller rather than guessed at.
+    """
+    channel, _, thread = value.partition("|")
+    if not channel or "|" in thread:
+        return None
+    return channel, thread or None
+
+
+def _reply_limit_blocks(note: str, channel: str, thread_ts: str | None) -> list[dict]:
+    """The gate notice: what happened, then one button to resume.
+
+    The note goes in a `section` block rather than only in the message `text`.
+    Slack renders `blocks` and stops rendering `text` as soon as blocks are
+    present, so a card carrying only the actions block showed a bare button and
+    never said what the limit was or what the button would do.
+
+    One button, no menu: the notice has exactly one action, and the typed
+    `$continue` prefix stays the alternative for anybody who would rather type.
+    """
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": note}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Continue"},
+                    "action_id": CONTINUE_ACTION_ID,
+                    "value": _continue_button_value(channel, thread_ts),
+                }
+            ],
+        },
+    ]
 
 
 def _retire_suggestion_block(blocks: list[dict], label: str) -> list[dict]:
@@ -1188,13 +1257,23 @@ class SlackFrontend(Frontend):
         self._spent_menus: dict[tuple[str, str], None] = {}
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
-        self._reply_counts: dict[int, int] = {}  # session -> agent replies sent
+        # session -> turns handed to the agent. Counted at dispatch (`_charge_turn`)
+        # rather than at the reply, so the gate reads a count that already
+        # includes every message queued ahead of the one it is looking at.
+        self._reply_counts: dict[int, int] = {}
         # session -> the gate notice waiting out its delay. One per thread, so a
         # sender who fires three messages into a gated thread gets one warning.
         self._gate_notices: dict[int, asyncio.Task[None]] = {}
         # session -> monotonic time the notice can no longer be deferred past.
         # Held across reschedules, which is what bounds the debounce.
         self._gate_deadlines: dict[int, float] = {}
+        # session -> the gated messages, oldest first, held as the events
+        # themselves so the Continue button can replay them exactly. A list
+        # because a burst is several messages, and the card belongs to the thread:
+        # one press has to recover everything the gate dropped, not just the last
+        # one. Only the newest wears GATED_EMOJI, so a burst leaves one mark. The
+        # resume paths pop the list, and that is what removes the reaction.
+        self._gated_msgs: dict[int, list[dict]] = {}
         # session -> everyone who has tagged the bot in that thread. A set rather
         # than the last one: a later tagger must not silently take over an earlier
         # tagger's claim. See `_hint_mention_required`.
@@ -1481,6 +1560,14 @@ class SlackFrontend(Frontend):
         async def handle_suggestion_action(ack, body):
             await ack()
             await self._on_suggestion_action(body)
+
+        # The gate notice's Continue button. Same reasoning as the suggestion
+        # buttons above: it renders on an ephemeral message under either token
+        # kind, so the handler cannot live in the bot-token-only block.
+        @self._app.action(re.compile(r"^cotf-continue$"))
+        async def handle_continue_action(ack, body):
+            await ack()
+            await self._on_continue_action(body)
 
         if self._is_bot_token:
             self._register_app_interactions()
@@ -1790,8 +1877,109 @@ class SlackFrontend(Frontend):
         self._pending_reply_suppressed.setdefault(chat_id, deque()).append(False)
         display = (body.get("user") or {}).get("name", "")
         # Same sender marker a typed message carries, so the agent sees who
-        # pressed the button.
+        # pressed the button. A tap is a turn like any other, so it pays the
+        # thread's budget the same way, and is charged at the same point: a tap
+        # queued behind a running turn must be counted before the next gate check.
+        self._charge_turn(chat_id)
         await self._on_message(chat_id, f"{sender_marker(sender_id, display)} {label}")
+
+    async def _on_continue_action(self, body: dict) -> None:
+        """Resume a gated thread from the gate notice's Continue button, and run
+        every message the gate dropped.
+
+        `_gated_msgs` holds the thread's backlog and is popped here, so a tap that
+        follows a typed `$continue` finds nothing to replay: that is what stops the
+        same message from being run twice. The card is the thread's, not the
+        sender's, so any allowed person who presses it drains the whole backlog.
+
+        Same dispatch gate as a typed message: the notice reaches one person, but
+        the payload is client-supplied, so an allowed sender is checked here
+        rather than assumed from who the card was addressed to.
+        """
+        actions = body.get("actions") or []
+        if not actions:
+            return
+        sender_id = (body.get("user") or {}).get("id", "")
+        if not self._is_allowed(sender_id):
+            logger.warning("slack: ignoring continue click from %s", sender_id)
+            return
+        routing = _parse_continue_value(actions[0].get("value", ""))
+        if routing is None:
+            logger.info("slack: continue click with unusable routing, dropping")
+            return
+        channel, thread_ts = routing
+        session_id = _session_key(channel, thread_ts)
+        self._reply_counts[session_id] = 0
+        gated = self._cancel_gate_notice(session_id)
+        await self._clear_gate_lock(gated)
+        logger.info(
+            "slack %s/%s: reply count reset via continue button", channel, thread_ts
+        )
+        if gated:
+            await self._replay_gated(channel, gated)
+        # Last, and never fatal: the thread is resumed by this point, and a card
+        # that will not go away must not take that back.
+        await self._delete_ephemeral(body.get("response_url", ""))
+
+    async def _replay_gated(self, channel: str, events: list[dict]) -> None:
+        """Run the messages the gate dropped, as if they had been sent again.
+
+        Oldest first, so the backlog reaches the agent in the order it was typed.
+
+        Every replay carries the `$continue` prefix, not only the first. The
+        prefix is what resets the budget, and a backlog longer than the limit
+        would otherwise re-gate its own tail on the way through.
+
+        The stored events are replayed, so the text, the files, the forwards and
+        the channel type are the ones the live path saw. The replay goes back
+        through `_ingest_event` rather than straight to the agent: that re-runs
+        the allowlist, the mention gate, the file downloads and the forwards.
+
+        A copy, because `_ingest_event` is handed a dict the caller still holds
+        and mutating the stored one would corrupt a later replay.
+        """
+        for event in events:
+            ts = str(event.get("ts") or "")
+            replay = dict(event)
+            replay["text"] = f"{CONTINUE_COMMAND} {event.get('text') or ''}".strip()
+            await self._ingest_event(replay)
+            # `_ingest_event` returns nothing whether it ran the message or
+            # dropped it, and every drop logs at debug. The ts is marked
+            # processed on the one path that reaches the agent, so this is what
+            # says which happened.
+            logger.info(
+                "continue: replayed gated message %s from %s (dispatched=%s)",
+                ts,
+                channel,
+                ts in self._processed_ts,
+            )
+
+    async def _delete_ephemeral(self, response_url: str) -> None:
+        """Take back an ephemeral card through the interaction's `response_url`.
+
+        `delete_original` is the documented way to remove an ephemeral message,
+        and it is the only handle available: the notice's `ts` is not kept, and
+        an ephemeral message never enters channel history to be found again.
+
+        Best-effort, and loud about failure. A card that outlives the thread it
+        resumed is a visible bug, so the reason Slack gave has to reach the log.
+        """
+        if not response_url:
+            logger.warning("delete_ephemeral: no response_url on the payload")
+            return
+        try:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(response_url, json={"delete_original": True}) as resp,
+            ):
+                if resp.status >= 400:
+                    logger.warning(
+                        "delete_ephemeral: response_url returned %s: %s",
+                        resp.status,
+                        await resp.text(),
+                    )
+        except Exception as exc:
+            logger.warning("delete_ephemeral: could not reach response_url: %s", exc)
 
     async def _retire_suggestion_menu(self, body: dict, label: str) -> None:
         """Rewrite the clicked message, collapsing the menu to a status line."""
@@ -1872,6 +2060,7 @@ class SlackFrontend(Frontend):
         thread_ts = await self._anchor_run(channel, None, f"Running `{prompt}`…")
         session_id = await self._enter_command_session(channel, user_id, thread_ts)
         if self._on_message:
+            self._charge_turn(session_id)
             await self._on_message(session_id, prompt)
 
     async def _handle_run_skill_shortcut(self, ack, shortcut) -> None:
@@ -1969,6 +2158,7 @@ class SlackFrontend(Frontend):
         )
         session_id = await self._enter_command_session(channel, user_id, thread_ts)
         if self._on_message:
+            self._charge_turn(session_id)
             await self._on_message(session_id, prompt)
 
     async def _enter_command_session(
@@ -2343,7 +2533,10 @@ class SlackFrontend(Frontend):
             self._reply_counts[session_id] = 0
             # A notice still waiting out its delay would land after the thread
             # has already resumed, telling the user to send what they just sent.
-            self._cancel_gate_notice(session_id)
+            # The gated messages go with it: typing the command is somebody
+            # asking to carry on, and the button is the way to ask for the
+            # backlog. See `_on_continue_action` for the other half.
+            await self._clear_gate_lock(self._cancel_gate_notice(session_id))
             text = stripped[len(CONTINUE_COMMAND) :].strip()
             logger.info(
                 "slack %s/%s: reply count reset via continue", channel, thread_ts
@@ -2355,6 +2548,7 @@ class SlackFrontend(Frontend):
                 thread_ts,
                 reply_soft_limit(),
             )
+            await self._mark_gated(session_id, event)
             self._schedule_reply_limit_warning(
                 session_id, channel, thread_ts, sender_id
             )
@@ -2418,6 +2612,9 @@ class SlackFrontend(Frontend):
             fwd_marker,
         )
         if self._on_message:
+            # Charged only on the path that reaches the agent, so a message the
+            # frontend drops never spends the thread's budget.
+            self._charge_turn(session_id)
             await self._on_message(session_id, final_text)
 
     async def _catchup(self) -> None:
@@ -2512,7 +2709,6 @@ class SlackFrontend(Frontend):
 
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
-            self._reply_counts[chat_id] = self._reply_counts.get(chat_id, 0) + 1
             logger.debug("send: ok ts=%s", resp["ts"])
             await self._upload_attachments(channel, thread_ts, response.attachments)
             return response.attachments
@@ -2605,10 +2801,83 @@ class SlackFrontend(Frontend):
         if task is not None:
             task.cancel()
 
-    def _cancel_gate_notice(self, session_id: int) -> None:
-        """Drop a pending notice and forget the thread's ceiling with it."""
+    def _charge_turn(self, session_id: int) -> None:
+        """Count a message as a turn, the moment it is handed to the agent.
+
+        Charged here rather than where the reply posts, which is where it used
+        to be. The reply lands when the agent finishes, so the count the gate
+        read at ingest was stale by exactly the depth of the queue: with the
+        limit at one, a message already running and a second one queued behind
+        it both saw a count of zero, and the thread went over budget without the
+        gate ever firing.
+        """
+        self._reply_counts[session_id] = self._reply_counts.get(session_id, 0) + 1
+
+    def _cancel_gate_notice(self, session_id: int) -> list[dict]:
+        """Drop a pending notice and forget the thread's ceiling with it.
+
+        Returns the thread's gated events, oldest first, and an empty list when
+        there were none, so an async caller can take the lock off and replay
+        them. Returning instead of unreacting here keeps this callable from the
+        synchronous teardown paths (`stop`, `_forget_session`), where a Slack
+        call can hang the loop.
+        """
         self._drop_gate_task(session_id)
         self._gate_deadlines.pop(session_id, None)
+        return self._gated_msgs.pop(session_id, [])
+
+    async def _clear_gate_lock(self, gated: list[dict]) -> None:
+        """Take GATED_EMOJI off a thread's gated messages.
+
+        Only the newest one wears it, because `_mark_gated` moves the mark there
+        as each message arrives, so only the newest is asked to give it up.
+        """
+        if not gated:
+            return
+        newest = gated[-1]
+        await self._unreact(newest["channel"], newest["ts"], GATED_EMOJI)
+
+    async def _mark_gated(self, session_id: int, event: dict) -> None:
+        """Lock a gated message, moving the mark off the previous one.
+
+        The whole event is kept, not just its timestamp. The Continue button
+        replays these exact messages, and the event carries everything the live
+        path had: the text, the files, the forwards, the channel type. Fetching
+        the message back from Slack instead was tried and abandoned. Both
+        `conversations.history` and `conversations.replies` return the thread's
+        parent when asked for one reply (`history` omits replies altogether, and
+        `replies` is oldest-first, so a `limit` of one lands on the parent), and
+        the fetch bought nothing anyway: this dict is in memory, so a restart
+        empties it and the tap can only resume either way.
+
+        The list is oldest-first, which is the order the Continue button drains
+        it in. One lock per thread: only the newest gated message wears
+        GATED_EMOJI, so a burst leaves one mark, on the message the notice is
+        about. Both reaction calls are best-effort -- `_react` and `_unreact`
+        already swallow the already-reacted and not-reacted errors.
+        """
+        backlog = self._gated_msgs.setdefault(session_id, [])
+        if any(stored.get("ts") == event.get("ts") for stored in backlog):
+            # The same message arriving twice. A gated message returns before the
+            # `_processed_ts` bookkeeping, so nothing else stops it: `_catchup`
+            # re-reads a channel after a reconnect and hands it back. One entry
+            # per message, or the button runs the same one twice.
+            logger.debug("slack: gated message %s is already held", event.get("ts"))
+            return
+        if backlog:
+            newest = backlog[-1]
+            await self._unreact(newest["channel"], newest["ts"], GATED_EMOJI)
+        backlog.append(event)
+        if len(backlog) > GATED_MSG_BACKLOG_MAX:
+            dropped = backlog.pop(0)
+            logger.warning(
+                "slack %s/%s: gated backlog over %d, dropped the oldest (%s)",
+                event["channel"],
+                event.get("thread_ts"),
+                GATED_MSG_BACKLOG_MAX,
+                dropped.get("ts"),
+            )
+        await self._react(event["channel"], event["ts"], GATED_EMOJI)
 
     async def _warn_reply_limit_later(
         self,
@@ -2754,11 +3023,18 @@ class SlackFrontend(Frontend):
     async def _warn_reply_limit(
         self, channel: str, thread_ts: str | None, sender_id: str = ""
     ) -> None:
-        """Tell the user the thread hit the reply soft-limit and how to resume.
+        """Tell the sender the thread hit the reply soft-limit, and offer a way out.
 
-        Addressed to the sender when there is one, so it arrives as a real
-        notification rather than a thread reply Slack can mark read on arrival.
-        A trusted bot has no user id, hence the plain form.
+        Posted as an ephemeral message, so the thread is not notified: a thread
+        reply reaches every participant, and the budget belongs to one person.
+        The cost is deliberate. An ephemeral message does not badge and does not
+        reach somebody who has left the thread, so a sender who walked away
+        learns nothing. The lock reaction on the gated message is the only trace
+        left in the thread.
+
+        A trusted bot has no user id, so it has no recipient for an ephemeral.
+        That case keeps the thread notice, and is the one path that still
+        notifies the thread.
         """
         who = f"<@{sender_id}> " if sender_id else ""
         note = (
@@ -2766,15 +3042,16 @@ class SlackFrontend(Frontend):
             f"Reply `{CONTINUE_COMMAND}` to keep going, or "
             f"`{CONTINUE_COMMAND} <your next message>` to continue and ask in one go."
         )
-        try:
-            resp = await self._app.client.chat_postMessage(
-                channel=channel, text=note, thread_ts=thread_ts
-            )
-        except Exception as exc:
-            logger.error("reply-limit: failed to post warning: %s", exc)
+        if not sender_id:
+            await self._post_notice(channel, thread_ts, note)
             return
-        if resp.get("ok"):
-            self._our_sent_timestamps.append(resp["ts"])
+        await self._post_ephemeral_notice(
+            channel,
+            thread_ts,
+            sender_id,
+            note,
+            blocks=_reply_limit_blocks(note, channel, thread_ts),
+        )
 
     async def _anchor_run(
         self, channel: str, thread_ts: str | None, label: str
@@ -2823,7 +3100,10 @@ class SlackFrontend(Frontend):
     async def _post_notice(
         self, channel: str, thread_ts: str | None, text: str
     ) -> None:
-        """Post a short control-command acknowledgement into the thread.
+        """Post a short notice into the thread.
+
+        Control-command acknowledgements, and the gate notice when its sender is
+        a trusted bot with no user id to address an ephemeral message to.
 
         Records the ts so a user-token deploy doesn't re-ingest our own notice
         as an inbound message (same echo guard as send/_warn_reply_limit)."""
@@ -2838,17 +3118,29 @@ class SlackFrontend(Frontend):
             self._our_sent_timestamps.append(resp["ts"])
 
     async def _post_ephemeral_notice(
-        self, channel: str, thread_ts: str | None, user: str, text: str
+        self,
+        channel: str,
+        thread_ts: str | None,
+        user: str,
+        text: str,
+        blocks: list[dict] | None = None,
     ) -> None:
         """Post a notice only `user` can see.
 
         No echo-guard bookkeeping, unlike `_post_notice`: an ephemeral message has
         no `ts` to record and Slack never delivers it back as an inbound event, so
         there is nothing a user-token deploy could re-ingest.
+
+        `text` is required even when `blocks` carries the real content: it is what
+        a client that cannot render blocks shows, and what a screen reader reads.
         """
         try:
             await self._app.client.chat_postEphemeral(
-                channel=channel, user=user, text=text, thread_ts=thread_ts
+                channel=channel,
+                user=user,
+                text=text,
+                blocks=blocks,
+                thread_ts=thread_ts,
             )
         except Exception as exc:
             logger.error("post_ephemeral_notice: failed to post %r: %s", text, exc)
@@ -2857,10 +3149,11 @@ class SlackFrontend(Frontend):
         """Post one mid-turn progress message into the thread the turn runs in.
 
         Its own `chat_postMessage` rather than `send()`, for two reasons that are
-        both about not spending the user's allowance: `send` counts a reply against
-        `slack.reply_soft_limit` (in both its arms, `send` and `_fallback_dm`), and
-        progress must not burn a ten-message budget; and a progress line is a
-        context block, not a reply with a stats footer.
+        both about not spending the user's allowance: a progress line is a context
+        block, not a reply with a stats footer; and `send` is the tail of a turn,
+        so routing progress through it would put narration and the answer on the
+        same path for no gain. The budget is charged at dispatch instead, where a
+        message becomes a turn, and a progress line is not one.
 
         DMs and group DMs only. That exemption from the reply budget is exactly why
         — in a channel, nothing at all would cap how much narration a heavy turn
@@ -3124,7 +3417,6 @@ class SlackFrontend(Frontend):
             return []
         if resp.get("ok"):
             self._our_sent_timestamps.append(resp["ts"])
-            self._reply_counts[chat_id] = self._reply_counts.get(chat_id, 0) + 1
             await self._upload_attachments(dm_channel, None, response.attachments)
             logger.info(
                 "fallback_dm: delivered response to %s for session %s",
