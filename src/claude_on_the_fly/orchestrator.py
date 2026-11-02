@@ -32,6 +32,7 @@ from claude_on_the_fly import (
     quota,
     sandbox,
     settings,
+    suggestion_deny,
     tmux,
     turns,
 )
@@ -309,13 +310,12 @@ def _fit_label(label: str) -> str:
 
 
 def _labels_from(data: object) -> list[str]:
-    """Suggestion labels out of a parsed block payload (a list of strings)."""
+    """Suggestion labels out of a parsed block payload (a list of strings), whole:
+    the width fit happens after the deny rule, in `_parse_suggestion_block`."""
     if not isinstance(data, list):
         return []
     return [
-        _fit_label(str(item).strip())
-        for item in data
-        if isinstance(item, str) and item.strip()
+        str(item).strip() for item in data if isinstance(item, str) and item.strip()
     ]
 
 
@@ -340,8 +340,14 @@ def _parse_suggestion_block(raw: str) -> list[str]:
             for line in content.splitlines():
                 match = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
                 if match:
-                    items.append(_fit_label(match.group(1)))
-    return items[:MAX_SUGGESTIONS]
+                    items.append(match.group(1))
+    # The operator's deny rule, applied here at the one exit every branch above
+    # reaches: on the whole label, before the width fit, so a denied string
+    # cannot survive as a cut fragment; and before the cap, so a dropped label
+    # does not cost a survivor its slot. The tap handlers check again: this side
+    # only keeps the button from being drawn.
+    kept = suggestion_deny.offer_filter(items)
+    return [_fit_label(label) for label in kept][:MAX_SUGGESTIONS]
 
 
 @dataclass(frozen=True)
@@ -2154,6 +2160,9 @@ async def run(frontend: Frontend, platform: str) -> None:
     # `sandbox.enabled()` meant the one deployment shape that most needs the
     # diagnostics was the shape that never got them.
     settings.check_operator_settings()
+    # Load the suggestion deny rule now, so a broken file is named at boot rather
+    # than at the first tap that it refuses.
+    suggestion_deny.current()
 
     # Heartbeat freshness is not an atomic startup guard: two daemons can both
     # pass it before either writes. Claim ownership before sweeping orphaned

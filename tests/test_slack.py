@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from collections import deque
@@ -5540,6 +5541,157 @@ class TestSuggestionActions:
         assert ("C0", "1.0") not in frontend._spent_menus
         assert ("C1", "99.1") in frontend._spent_menus
         frontend._on_message.assert_awaited_once()
+
+
+REFUSAL_LINE = (
+    "Not sent: this button is disabled by a deny rule (or the rule file could not "
+    "be read). Type your reply instead."
+)
+
+
+class TestSuggestionDenyTap:
+    """A tap whose label matches `suggestions.deny_file` is refused, whoever drew
+    the button: the handler is the one point every `cotf-sugg:` tap passes."""
+
+    _tap = staticmethod(TestSuggestionActions._tap)
+
+    @pytest.fixture(autouse=True)
+    def _wired(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+        frontend._app.client.chat_postMessage.return_value = {"ok": True, "ts": "99.9"}
+
+    async def test_a_denied_tap_is_not_dispatched(self, frontend, deny_file):
+        await frontend._on_suggestion_action(self._tap(label="R12-ABCD-3X4"))
+        frontend._on_message.assert_not_awaited()
+
+    async def test_a_denied_tap_leaves_the_turn_bookkeeping_alone(
+        self, frontend, deny_file
+    ):
+        chat_id = _session_key("C1", "t1")
+        with patch.object(frontend, "_charge_turn") as charge:
+            await frontend._on_suggestion_action(self._tap(label="R12-ABCD-3X4"))
+        charge.assert_not_called()
+        assert chat_id not in frontend._pending_msg
+        assert chat_id not in frontend._pending_reply_suppressed
+
+    async def test_a_denied_tap_retires_the_menu_without_a_check(
+        self, frontend, deny_file
+    ):
+        await frontend._on_suggestion_action(self._tap(label="R12-ABCD-3X4"))
+        update = frontend._app.client.chat_update.await_args.kwargs
+        assert all(b["type"] != "actions" for b in update["blocks"])
+        status = next(b for b in update["blocks"] if b["type"] == "context")
+        text = status["elements"][0]["text"]
+        assert text.startswith("⊘ R12-ABCD-3X4"), text
+        assert "✓" not in text
+
+    async def test_a_denied_tap_posts_one_generic_line_in_the_thread(
+        self, frontend, deny_file
+    ):
+        frontend._app.client.chat_postMessage.reset_mock()
+        await frontend._on_suggestion_action(self._tap(label="R12-ABCD-3X4"))
+        frontend._app.client.chat_postMessage.assert_awaited_once()
+        kwargs = frontend._app.client.chat_postMessage.await_args.kwargs
+        assert kwargs["channel"] == "C1"
+        assert kwargs["thread_ts"] == "t1"
+        assert kwargs["text"] == REFUSAL_LINE
+
+    async def test_a_denied_tap_logs_a_refused_line_never_a_button_line(
+        self, frontend, deny_file, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(self._tap(label="R12-ABCD-3X4"))
+        lines = [r.getMessage() for r in caplog.records]
+        refused = [ln for ln in lines if ln.startswith("slack C1/t1: ")]
+        assert len(refused) == 1, lines
+        assert refused[0].endswith("[menu-ts: 99.1] R12-ABCD-3X4 (button refused)")
+        assert not [ln for ln in lines if ln.endswith(" (button)")]
+        assert [ln for ln in lines if ln.startswith("suggestion-deny: tap refused")]
+
+    async def test_a_denied_tap_spends_the_menu(self, frontend, deny_file):
+        await frontend._on_suggestion_action(self._tap(label="R12-ABCD-3X4"))
+        await frontend._on_suggestion_action(self._tap(label="what can you do?"))
+        frontend._on_message.assert_not_awaited()
+        assert frontend._app.client.chat_postMessage.await_count == 1
+
+    async def test_an_unreadable_rule_file_refuses_every_tap(
+        self, frontend, deny_file, caplog
+    ):
+        deny_file.unlink()
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(self._tap(label="what can you do?"))
+        frontend._on_message.assert_not_awaited()
+        kwargs = frontend._app.client.chat_postMessage.await_args.kwargs
+        assert kwargs["text"] == REFUSAL_LINE
+        assert caplog.text.count("(button refused)") == 1
+
+    async def test_a_pattern_that_does_not_compile_refuses_every_tap(
+        self, frontend, deny_file
+    ):
+        deny_file.write_text(json.dumps({"patterns": ["(unclosed"]}))
+        await frontend._on_suggestion_action(self._tap(label="what can you do?"))
+        frontend._on_message.assert_not_awaited()
+
+    async def test_an_ordinary_tap_is_unchanged_with_rules_configured(
+        self, frontend, deny_file, caplog
+    ):
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(self._tap(label="WIDGET-Q4 移除"))
+        assert frontend._on_message.await_args.args[1] == (
+            '[from-id: U_ALLOWED] [display: "hoss"] WIDGET-Q4 移除'
+        )
+        lines = [r.getMessage() for r in caplog.records]
+        assert (
+            'slack C1/t1: [from-id: U_ALLOWED] [display: "hoss"] [menu-ts: 99.1] '
+            "WIDGET-Q4 移除 (button)"
+        ) in lines
+
+    async def test_no_key_dispatches_a_code_shaped_tap(
+        self, frontend, operator_settings
+    ):
+        operator_settings.write_text("suggestions:\n  enabled: true\n")
+        await frontend._on_suggestion_action(self._tap(label="R12-ABCD-3X4"))
+        frontend._on_message.assert_awaited_once()
+        update = frontend._app.client.chat_update.await_args.kwargs
+        status = next(b for b in update["blocks"] if b["type"] == "context")
+        assert status["elements"][0]["text"] == "✓ R12-ABCD-3X4"
+
+
+class TestSuggestionTapProvenance:
+    """A tap is marked as a tap in the turn's source-event block, not in its text."""
+
+    _tap = staticmethod(TestSuggestionActions._tap)
+
+    async def test_a_tap_carries_a_button_source_event(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+
+        await frontend._on_suggestion_action(self._tap(label="alpha?"))
+
+        source = frontend._on_message.await_args.kwargs["source_event"]
+        payload = source.payload(replayed=False)
+        assert payload["via"] == "button"
+        assert payload["ts"] == "99.1"
+        assert payload["thread_ts"] == "t1"
+        assert payload["text"] == "alpha?"
+        assert payload["user"] == "U_ALLOWED"
+        assert payload["is_original_event"] is False
+
+    async def test_a_typed_message_carries_no_via(self, frontend):
+        await frontend._ingest_event(
+            {
+                "ts": "200.0",
+                "channel": "D1",
+                "channel_type": "im",
+                "user": "U_ALLOWED",
+                "text": "typed",
+            }
+        )
+        source = frontend._on_message.await_args.kwargs["source_event"]
+        payload = source.payload(replayed=False)
+        assert "via" not in payload
+        assert payload["is_original_event"] is True
 
 
 class TestContinueAction:

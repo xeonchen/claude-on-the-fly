@@ -2040,6 +2040,80 @@ class TestDoneTap:
         update.callback_query = None
         await frontend._on_done_tap(update, None)
 
+    async def test_a_refused_remnant_does_not_claim_it_was_sent(self, frontend):
+        update = TestSuggestionTap()._update(123, "cotf-done:refused")
+
+        await frontend._on_done_tap(update, None)
+
+        update.callback_query.answer.assert_awaited_once_with(text="Not sent.")
+
+
+REFUSAL_LINE = (
+    "Not sent: this button is disabled by a deny rule (or the rule file could not "
+    "be read). Type your reply instead."
+)
+
+
+class TestSuggestionDenyTap:
+    """The Telegram twin of the Slack tap refusal."""
+
+    LABELS = ["R12-ABCD-3X4", "what can you do?"]
+
+    @pytest.fixture(autouse=True)
+    def _wired(self, frontend):
+        frontend._on_message = AsyncMock()
+        frontend._app = MagicMock()
+        frontend._app.bot.edit_message_reply_markup = AsyncMock()
+        frontend._app.bot.send_message = AsyncMock()
+        frontend._suggestion_labels[(1, 7)] = list(self.LABELS)
+
+    @staticmethod
+    def _update(data: str) -> MagicMock:
+        return TestSuggestionTap()._update(123, data)
+
+    async def test_a_denied_tap_is_refused_and_says_so(
+        self, frontend, deny_file, caplog
+    ):
+        update = self._update("cotf-sugg:0")
+        with caplog.at_level("INFO", logger="claude_on_the_fly.telegram"):
+            await frontend._on_suggestion_tap(update, None)
+
+        frontend._on_message.assert_not_awaited()
+        update.callback_query.answer.assert_awaited_once_with(text="Not sent.")
+        edit = frontend._app.bot.edit_message_reply_markup.await_args.kwargs
+        [button] = [row[0] for row in edit["reply_markup"].inline_keyboard]
+        assert button.text == "⊘ R12-ABCD-3X4"
+        assert button.callback_data == "cotf-done:refused"
+        sent = frontend._app.bot.send_message.await_args.kwargs
+        assert sent["chat_id"] == 1
+        assert sent["text"] == REFUSAL_LINE
+        lines = [r.getMessage() for r in caplog.records]
+        assert [ln for ln in lines if ln.endswith("R12-ABCD-3X4 (button refused)")]
+        assert (1, 7) not in frontend._suggestion_labels
+
+    async def test_an_unreadable_rule_file_refuses_every_tap(self, frontend, deny_file):
+        deny_file.write_text("[]")
+        await frontend._on_suggestion_tap(self._update("cotf-sugg:1"), None)
+        frontend._on_message.assert_not_awaited()
+        assert frontend._app.bot.send_message.await_args.kwargs["text"] == REFUSAL_LINE
+
+    async def test_a_refusal_whose_retire_fails_still_says_so(
+        self, frontend, deny_file
+    ):
+        from telegram.error import TelegramError
+
+        frontend._app.bot.edit_message_reply_markup = AsyncMock(
+            side_effect=TelegramError("gone")
+        )
+        await frontend._on_suggestion_tap(self._update("cotf-sugg:0"), None)
+        frontend._on_message.assert_not_awaited()
+        assert frontend._app.bot.send_message.await_args.kwargs["text"] == REFUSAL_LINE
+
+    async def test_an_ordinary_tap_still_sends(self, frontend, deny_file):
+        await frontend._on_suggestion_tap(self._update("cotf-sugg:1"), None)
+        frontend._on_message.assert_awaited_once()
+        assert frontend._on_message.await_args.args[1].endswith(" what can you do?")
+
 
 # ---------------------------------------------------------------------------
 # Settings summary and session persistence

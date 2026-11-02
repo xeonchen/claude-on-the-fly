@@ -317,3 +317,35 @@ def account_sandbox_mode(request, monkeypatch):
     monkeypatch.setenv("COTF_SANDBOX", request.param)
     monkeypatch.setenv("COTF_SANDBOX_FS", "deny-most")
     return request.param
+
+
+# A code-shape example rule for the suggestion-deny tests: uppercase,
+# hyphen-joined, at least one segment of three or more characters mixing letters
+# and digits, bounded by look-arounds; plus one exact shape with a numbered
+# segment and a six-character base32 tail.
+SUGGESTION_DENY_PATTERNS = [
+    r"(?<![A-Za-z0-9])(?=(?:[A-Z0-9]+-)+[A-Z0-9]+(?![A-Za-z0-9]))(?:[A-Z0-9]+-)*"
+    r"(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*[0-9])[A-Z0-9]{3,}(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9])GH(?:-[A-Z0-9]+)+-[0-9]+-[A-Z2-7]{6}(?![A-Za-z0-9])",
+]
+
+
+@pytest.fixture
+def deny_file(operator_settings, tmp_path, monkeypatch):
+    """An operator `config.yaml` whose `suggestions.deny_file` names a rule file.
+
+    Returns the rule file's path, already holding SUGGESTION_DENY_PATTERNS; a test
+    that wants another state rewrites it. The module's last-seen state is reset so
+    one test's load (and its once-per-state log line) cannot leak into the next.
+    """
+    from claude_on_the_fly import suggestion_deny
+
+    monkeypatch.setattr(suggestion_deny, "_LAST", None)
+    path = tmp_path / "suggestion-deny.json"
+    path.write_text(
+        json.dumps({"patterns": SUGGESTION_DENY_PATTERNS, "why": "typed, not tapped"})
+    )
+    operator_settings.write_text(
+        f"suggestions:\n  deny_file: {json.dumps(str(path))}\n"
+    )
+    return path

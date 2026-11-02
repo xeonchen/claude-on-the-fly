@@ -18,6 +18,7 @@ src/claude_on_the_fly/
   pricing.py           # OpenRouter-backed price table (codex)
   logs.py              # Log naming (<role>-<host>-<date>), rollover, retention
   orchestrator.py      # Shared session/queue layer for chat frontends
+  suggestion_deny.py   # Operator deny rule for suggestion-button labels (offer + tap)
   migration.py         # Folds a pre-shared-workspace thread directory into its workspace
   interim.py           # Mid-turn progress: coalescing + rate limiting for one turn
   model_command.py     # The $model / /model command: grammar, catalogue checks, wording

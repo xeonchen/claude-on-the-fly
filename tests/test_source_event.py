@@ -80,3 +80,27 @@ def test_adapter_replay_is_historical_even_before_a_restart(event):
         replace(event, is_replayed=True).payload(replayed=False)["is_original_event"]
         is False
     )
+
+
+def test_a_button_tap_is_never_an_original_event(event):
+    tapped = replace(event, via="button")
+    payload = tapped.payload(replayed=False)
+    assert payload["via"] == "button"
+    assert payload["is_original_event"] is False
+    assert '"via": "button"' in source_event_note(tapped, replayed=False)
+
+
+def test_a_tap_snapshot_survives_the_journal(event):
+    tapped = replace(event, via="button")
+    assert SourceEvent.from_dict(json.loads(json.dumps(asdict(tapped)))) == tapped
+
+
+def test_a_snapshot_with_a_non_string_via_is_unavailable(event):
+    raw = asdict(event) | {"via": 1}
+    assert SourceEvent.from_dict(raw) is None
+
+
+def test_an_ordinary_event_payload_has_no_via(event):
+    payload = event.payload(replayed=False)
+    assert "via" not in payload
+    assert payload["is_original_event"] is True

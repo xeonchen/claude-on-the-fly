@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
-from claude_on_the_fly import logs, settings
+from claude_on_the_fly import logs, settings, suggestion_deny
 from claude_on_the_fly.agent import (
     DATA_DIR,
     Response,
@@ -457,6 +457,13 @@ class TelegramFrontend(Frontend):
             self._spent_menus[key] = None
             if len(self._spent_menus) > SUGGESTION_SPENT_CAP:
                 self._spent_menus.pop(next(iter(self._spent_menus)))
+        # The operator's deny rule. `key` is set whenever a label resolved, since
+        # the label came out of the store under it; a refusal returns either way.
+        refusal = suggestion_deny.tap_refusal(label)
+        if refusal is not None:
+            if key is not None:
+                await self._refuse_suggestion_tap(query, key, label, refusal)
+            return
         await query.answer(text=f"Sent: {label}")
         if message is not None and self._app is not None:
             try:
@@ -482,25 +489,66 @@ class TelegramFrontend(Frontend):
         # pressed the button.
         await self._on_message(chat_id, f"{sender_marker(chat_id, sender)} {label}")
 
+    async def _refuse_suggestion_tap(
+        self, query: CallbackQuery, key: tuple[int, int], label: str, refusal: str
+    ) -> None:
+        """Turn away a tap the operator's deny rule refuses.
+
+        The Telegram twin of the Slack refusal: nothing is dispatched, the menu
+        is retired with a mark that is not ✓, one generic line says so in the
+        chat, and the log line ends in `(button refused)`, never `(button)`.
+        """
+        chat_id, message_id = key
+        await query.answer(text="Not sent.")
+        try:
+            if self._app is not None:
+                await self._app.bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=self._marked_keyboard(label, refused=True),
+                )
+        except TelegramError as exc:
+            logger.warning("could not retire suggestion menu: %s", exc)
+        finally:
+            self._suggestion_labels.pop(key, None)
+        sender = self._chat_names.get(chat_id, "unknown")
+        logger.info(
+            "chat %s: %s %s (button refused)",
+            chat_id,
+            sender_marker(chat_id, sender),
+            label,
+        )
+        logger.warning(
+            "%s: tap refused in chat %s (%s)", suggestion_deny.TAG, chat_id, refusal
+        )
+        if self._app is not None:
+            await self._send_msg(chat_id, suggestion_deny.REFUSAL_TEXT)
+
     async def _on_done_tap(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """A spent shortcut button: the label was already sent, just confirm."""
+        """A spent shortcut button: confirm what became of it, send nothing."""
         query = update.callback_query
         if query is not None:
-            await query.answer(text="Already sent.")
+            refused = (query.data or "").endswith(":refused")
+            await query.answer(text="Not sent." if refused else "Already sent.")
 
     @staticmethod
-    def _marked_keyboard(label: str) -> InlineKeyboardMarkup:
+    def _marked_keyboard(label: str, *, refused: bool = False) -> InlineKeyboardMarkup:
         """The keyboard after a tap: only the picked button, marked and retired.
 
         The rest of the menu is dropped rather than left live, so a second
         press cannot send a second message. The ✓ remnant names the pick and
-        stays in the chat as history; its `cotf-done` callback is a no-op.
+        stays in the chat as history; its `cotf-done` callback is a no-op. A
+        refused pick is marked ⊘ instead, and its callback says it was not sent.
         """
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton(f"✓ {label}", callback_data="cotf-done:0")]]
-        )
+        if refused:
+            button = InlineKeyboardButton(
+                f"⊘ {label}", callback_data="cotf-done:refused"
+            )
+        else:
+            button = InlineKeyboardButton(f"✓ {label}", callback_data="cotf-done:0")
+        return InlineKeyboardMarkup([[button]])
 
     @staticmethod
     def _suggestion_index(data: str) -> int:

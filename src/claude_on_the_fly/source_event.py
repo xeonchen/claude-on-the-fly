@@ -22,6 +22,11 @@ class SourceEvent:
     bot_profile_user_id: str = ""
     is_forwarded: bool = False
     is_replayed: bool = False
+    # How the turn was produced when it is not a message somebody sent: "button"
+    # for a suggestion tap, whose `ts` is the menu message the tap answered and
+    # whose `text` is the tapped label. Empty for an ordinary message, and then
+    # left out of the payload, so a typed turn's block is exactly what it was.
+    via: str = ""
 
     @classmethod
     def from_dict(cls, value: object) -> SourceEvent | None:
@@ -45,11 +50,15 @@ class SourceEvent:
             "user_id": event.pop("bot_profile_user_id"),
         }
         replayed = replayed or self.is_replayed
-        event["is_original_event"] = not replayed and not self.is_forwarded
+        event["is_original_event"] = (
+            not replayed and not self.is_forwarded and not self.via
+        )
         event["is_replayed"] = replayed
         # Slack's ordinary messages have no subtype, not an empty subtype.
         if not self.subtype:
             event.pop("subtype")
+        if not self.via:
+            event.pop("via")
         return event
 
 
