@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -49,8 +50,8 @@ DROP_REASONS = ("duplicate", "rate-limited", "ledger-write-failed", "retire-fail
 
 Key = tuple[str, str, str]
 
-# Characters that would let one drop-line field end early or start a new line.
-_FIELD_UNSAFE = re.compile(r"[\[\]\r\n]")
+# Brackets would let one drop-line field end early.
+_FIELD_UNSAFE = re.compile(r"[\[\]]")
 
 
 def _fsync_dir(path: Path) -> None:
@@ -74,10 +75,13 @@ class PressLedger:
         self._keys: set[Key] | None = None
 
     def ensure(self) -> None:
-        """Create the ledger empty if it is absent; never truncate it."""
+        """Prove the ledger can be appended to, creating it empty if absent.
+
+        Always opened for append, never truncated: a ledger that exists but
+        cannot be written (read-only, wrong owner) fails here, at start, rather
+        than at the first press.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.is_file():
-            return
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.fsync(fd)
@@ -85,18 +89,24 @@ class PressLedger:
             os.close(fd)
         _fsync_dir(self.path.parent)
 
-    def _load(self) -> set[Key]:
+    def _load(self) -> set[Key] | None:
+        """Every key in the file, or None when it cannot be read now."""
         keys: set[Key] = set()
         try:
             text = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return keys
         except OSError as exc:
-            # Read as empty, loudly: a press after this may count twice, which
-            # the reader downstream sees as two ledger lines for one key.
+            # Read as empty, loudly, and not remembered: the next call reads
+            # again. A press meanwhile may count twice, which the reader
+            # downstream sees as two ledger lines for one key.
             logger.warning("press ledger: cannot read %s: %s", self.path, exc)
-            return keys
-        for line in text.splitlines():
+            return None
+        # Lines end at "\n" only. `splitlines()` would also split on U+2028,
+        # U+2029 and U+0085, which a line written by another tool may hold raw.
+        for line in text.split("\n"):
+            if not line:
+                continue
             try:
                 row = json.loads(line)
                 keys.add((row["channel"], row["message_ts"], row["block_id"]))
@@ -107,7 +117,7 @@ class PressLedger:
     def has(self, key: Key) -> bool:
         if self._keys is None:
             self._keys = self._load()
-        return key in self._keys
+        return self._keys is not None and key in self._keys
 
     def append(self, record: dict) -> None:
         """Append one press as one JSON line and fsync it.
@@ -118,17 +128,30 @@ class PressLedger:
         """
         if not record.get("action_ts"):
             raise ValueError("press has no action_ts")
-        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        # ASCII only, so no character in a label can end a line for any reader.
+        data = (json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n").encode()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            os.write(fd, line.encode("utf-8"))
+            size = os.fstat(fd).st_size
+            # A torn tail from an earlier failed write would otherwise glue this
+            # line onto it, and both would be skipped on load.
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                data = b"\n" + data
+            while data:
+                written = os.write(fd, data)
+                if written <= 0:
+                    raise OSError("press ledger: write made no progress")
+                data = data[written:]
             os.fsync(fd)
         finally:
             os.close(fd)
         if self._keys is None:
             self._keys = self._load()
-        self._keys.add((record["channel"], record["message_ts"], record["block_id"]))
+        if self._keys is not None:
+            self._keys.add(
+                (record["channel"], record["message_ts"], record["block_id"])
+            )
 
 
 _ISO_SECONDS = "%Y-%m-%dT%H:%M:%SZ"
@@ -215,7 +238,22 @@ class PressRateLimit:
 
 
 def _field(value: str) -> str:
-    return _FIELD_UNSAFE.sub("_", value) if value else "-"
+    """One drop-line field: no bracket, and no control, format or separator
+    character (U+2028 and its kin included) that a reader could split on."""
+    if not value:
+        return "-"
+    cleaned = "".join(
+        "_" if unicodedata.category(ch)[0] in "CZ" and ch != " " else ch for ch in value
+    )
+    return _FIELD_UNSAFE.sub("_", cleaned)
+
+
+def withdraw_marker(path: Path) -> None:
+    """Remove the start-up marker, so readers stop trusting this ledger."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.error("press ledger: cannot remove marker %s: %s", path, exc)
 
 
 def drop_line(
