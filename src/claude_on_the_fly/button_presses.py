@@ -77,12 +77,13 @@ class PressLedger:
     def ensure(self) -> None:
         """Prove the ledger can be appended to, creating it empty if absent.
 
-        Always opened for append, never truncated: a ledger that exists but
-        cannot be written (read-only, wrong owner) fails here, at start, rather
-        than at the first press.
+        Opened exactly as `append` opens it (read and append; it reads the last
+        byte to close a torn tail), never truncated: a ledger that exists but
+        cannot be used that way (read-only, write-only, wrong owner) fails
+        here, at start, rather than at the first press.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.fsync(fd)
         finally:

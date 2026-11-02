@@ -85,6 +85,20 @@ class TestPressLedger:
     def test_a_missing_ledger_reads_as_empty(self, tmp_path):
         assert not PressLedger(tmp_path / "absent.jsonl").has(("C1", "1", "b"))
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root is never refused a read")
+    def test_ensure_proves_a_write_only_ledger_unusable(self, tmp_path):
+        # An append reads the last byte to close a torn tail, so a ledger that
+        # can be written but not read fails at start, not at the first press.
+        path = tmp_path / "presses.jsonl"
+        path.write_text("")
+        path.chmod(0o200)
+        try:
+            with pytest.raises(PermissionError):
+                PressLedger(path).ensure()
+        finally:
+            path.chmod(0o600)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root is never refused a write")
     def test_ensure_proves_an_existing_ledger_is_writable(self, tmp_path):
         path = tmp_path / "presses.jsonl"
         path.write_text("")

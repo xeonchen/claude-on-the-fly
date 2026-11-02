@@ -8771,7 +8771,7 @@ NOT_COUNTED_DUPLICATE = "This press was not counted: it repeats an earlier press
 NOT_COUNTED_RATE = (
     "This press was not counted: too many presses in a minute, press again shortly."
 )
-NOT_COUNTED_UNRECORDED = "This press was not counted: it could not be recorded."
+NOT_COUNTED_UNRECORDED = "This press was passed on, but it may not have been recorded."
 
 
 async def _yield(*args, **kwargs):
@@ -8993,6 +8993,44 @@ class TestButtonPressLedger:
         )
         frontend._on_message.assert_awaited_once()
 
+    async def test_two_presses_on_an_unregistered_thread_write_one_line(self, frontend):
+        # After a restart or a cap eviction the thread is registered on the
+        # press, and that registration suspends between the spent mark and the
+        # ledger append: the mark must already be taken when it does.
+        frontend._sessions.clear()
+        frontend._workspace_names.clear()
+
+        async def enter(*args, **kwargs):
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        frontend._enter_command_session = enter
+        frontend._app.client.chat_update = AsyncMock(side_effect=_yield)
+        frontend._on_message.side_effect = _yield
+        frontend._respond_ephemeral = AsyncMock(side_effect=_yield)
+        await asyncio.gather(
+            frontend._on_suggestion_action(self._press()),
+            frontend._on_suggestion_action(self._press(action_ts="100.3")),
+        )
+        assert len(self._lines()) == 1
+        frontend._on_message.assert_awaited_once()
+
+    async def test_a_duplicate_is_refused_before_any_session_setup(self, frontend):
+        # The duplicate check comes ahead of everything: a refused re-press must
+        # not register a thread or ask Slack about it.
+        frontend._sessions.clear()
+        frontend._workspace_names.clear()
+        entered: list[str] = []
+
+        async def enter(channel, *args, **kwargs):
+            entered.append(channel)
+
+        frontend._enter_command_session = enter
+        await frontend._on_suggestion_action(self._press())
+        await frontend._on_suggestion_action(self._press(action_ts="100.3"))
+        assert entered == ["C1"]
+        frontend._on_message.assert_awaited_once()
+
     async def test_the_press_dispatches_right_after_the_append_and_retires_last(
         self, frontend
     ):
@@ -9127,6 +9165,15 @@ class TestButtonPressLedger:
         assert status["elements"][0]["text"] == "⚠ alpha? (hoss) — not recorded"
         assert status["block_id"] == "cotf-retired:menu-a"
 
+    async def test_a_press_without_action_ts_leaves_the_marker(self, frontend):
+        # One malformed payload is a defect of that payload, not of the ledger,
+        # so it must not switch the marker off for every later press.
+        frontend._open_press_ledger()
+        marker = self._ledger_path().parent / "slack.button-presses.marker.json"
+        await frontend._on_suggestion_action(self._press(action_ts=""))
+        assert marker.exists()
+        assert self._lines() == []
+
     async def test_a_failed_append_withdraws_the_marker(self, frontend):
         frontend._open_press_ledger()
         marker = self._ledger_path().parent / "slack.button-presses.marker.json"
@@ -9235,6 +9282,7 @@ class TestPressLedgerAtStart:
         await self._start(frontend)
         assert not (self._state() / "slack.button-presses.marker.json").exists()
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root is never refused a write")
     async def test_a_read_only_ledger_fails_at_start_and_drops_the_old_marker(
         self, frontend, caplog
     ):
