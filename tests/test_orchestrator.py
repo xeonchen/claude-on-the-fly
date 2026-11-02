@@ -28,6 +28,7 @@ from claude_on_the_fly.orchestrator import (
     Turn,
     _display_width,
     _extract_suggestions,
+    _fit_label,
     _parse_suggestion_block,
 )
 from claude_on_the_fly.protocol import Frontend, LegacyWorkspace, interrupted_notice
@@ -4027,6 +4028,109 @@ class TestSuggestionsParsing:
         )
         assert body == "answer"
         assert labels == ["x?"]
+
+
+# Labels an operator's deny rule exists to catch, and labels it must leave alone.
+DENIED_LABELS = [
+    "R12-ABCD-3X4",
+    "R34-ABCD-5Y6",
+    "FOO-9Z8Y7X",
+    "ZZZ100-K1Q2",
+    "ZZZ101-H2J3",
+    "9F8E-Q12",
+    "BB12-WXYZ-3D4",
+    "PRJ12345-K9M",
+    "PRJ12345-T4V",
+]
+ALLOWED_LABELS = [
+    "WIDGET-Q4 移除",
+    "看 2030-01-02-a1b2",
+    "看 PRJ-12345",
+    "查 foo-1min",
+    "Q4-OKR",
+    "GPT-4O",
+]
+
+
+class TestSuggestionDenyOffer:
+    """`suggestions.deny_file` drops matching labels before any button is drawn."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '["keep?", "R12-ABCD-3X4"]',  # JSON
+            "['keep?', 'R12-ABCD-3X4',]",  # Python literal
+            "- keep?\n- R12-ABCD-3X4",  # markdown list
+            '```json\n["keep?", "R12-ABCD-3X4"]\n```',  # fenced JSON
+        ],
+        ids=["json", "literal", "markdown", "fenced"],
+    )
+    def test_every_parse_branch_drops_a_denied_label(self, deny_file, raw):
+        assert _parse_suggestion_block(raw) == ["keep?"]
+
+    @pytest.mark.parametrize("label", DENIED_LABELS)
+    def test_each_code_shaped_label_is_dropped(self, deny_file, label):
+        assert _parse_suggestion_block(json.dumps([label])) == []
+
+    @pytest.mark.parametrize("label", ALLOWED_LABELS)
+    def test_each_ordinary_label_is_kept(self, deny_file, label):
+        assert _parse_suggestion_block(json.dumps([label])) == [label]
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "R12\u2013ABCD\u20133X4",  # en dash
+            "R12\u2212ABCD\u22123X4",  # minus sign
+            "R12_ABCD_3X4",  # underscore
+            "\uff32\uff11\uff12\uff0d\uff21\uff22\uff23\uff24\uff0d\uff13\uff38\uff14",
+            "\u9001\u51fa PRJ12345-K9M",  # inside a sentence
+            "GH-ACME-WIDGETS-1710-ABCDEF",  # the numbered base32 shape
+        ],
+    )
+    def test_dash_width_and_sentence_variants_are_dropped(self, deny_file, label):
+        assert _parse_suggestion_block(json.dumps([label])) == []
+
+    def test_a_code_past_the_width_cut_is_dropped_whole(self, deny_file):
+        # Fitted first, this label would be offered as "請…R12…", a fragment the
+        # rule no longer recognises. The rule sees the whole label.
+        label = "請" * 14 + "R12-ABCD-3X4"
+        assert _fit_label(label) == "請" * 14 + "R12…"
+        assert _parse_suggestion_block(json.dumps([label])) == []
+        assert _parse_suggestion_block(f"- {label}") == []
+
+    def test_drops_happen_before_the_cap(self, deny_file):
+        # Five survivors are still five buttons when a denied label came first.
+        labels = ["R12-ABCD-3X4"] + [f"q{i}?" for i in range(5)]
+        assert _parse_suggestion_block(json.dumps(labels)) == labels[1:]
+
+    def test_each_drop_is_logged_under_the_tag(self, deny_file, caplog):
+        with caplog.at_level("INFO", logger="claude_on_the_fly.suggestion_deny"):
+            _parse_suggestion_block('["R12-ABCD-3X4", "FOO-9Z8Y7X", "keep?"]')
+        drops = [
+            r.getMessage() for r in caplog.records if "offer dropped" in r.getMessage()
+        ]
+        assert len(drops) == 2
+        assert all(line.startswith("suggestion-deny: ") for line in drops)
+
+    def test_an_unreadable_rule_file_drops_nothing(self, deny_file, caplog):
+        deny_file.write_text("{not json")
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.suggestion_deny"):
+            assert _parse_suggestion_block('["R12-ABCD-3X4"]') == ["R12-ABCD-3X4"]
+        assert "suggestion-deny: " in caplog.text
+        assert "unreadable" in caplog.text
+
+    def test_an_edit_to_the_rule_file_is_picked_up(self, deny_file):
+        deny_file.write_text(json.dumps({"patterns": ["^NEVER$"]}))
+        assert _parse_suggestion_block('["R12-ABCD-3X4"]') == ["R12-ABCD-3X4"]
+        deny_file.write_text(json.dumps({"patterns": ["ABCD"]}))
+        stat = deny_file.stat()
+        os.utime(deny_file, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        assert _parse_suggestion_block('["R12-ABCD-3X4"]') == []
+
+    def test_no_key_keeps_every_label(self, operator_settings):
+        operator_settings.write_text("suggestions:\n  enabled: true\n")
+        labels = DENIED_LABELS[:5]
+        assert _parse_suggestion_block(json.dumps(labels)) == labels
 
 
 # ---------------------------------------------------------------------------

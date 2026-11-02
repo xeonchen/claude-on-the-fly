@@ -29,7 +29,7 @@ from slack_sdk.http_retry.builtin_async_handlers import (
 )
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
-from claude_on_the_fly import checks, logs, settings
+from claude_on_the_fly import checks, logs, settings, suggestion_deny
 from claude_on_the_fly.agent import (
     DATA_DIR,
     MAX_ATTACHMENT_BYTES,
@@ -911,7 +911,9 @@ def _mention_notice_blocks(
     ]
 
 
-def _retire_suggestion_block(blocks: list[dict], label: str) -> list[dict]:
+def _retire_suggestion_block(
+    blocks: list[dict], label: str, *, mark: str = "✓"
+) -> list[dict]:
     """Rebuild message blocks with the suggestion menu collapsed to a status line.
 
     The whole menu goes on any tap, not just the tapped button: a second click
@@ -928,7 +930,7 @@ def _retire_suggestion_block(blocks: list[dict], label: str) -> list[dict]:
         retired.append(
             {
                 "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"✓ {label}"}],
+                "elements": [{"type": "mrkdwn", "text": f"{mark} {label}"}],
             }
         )
     return retired
@@ -2297,13 +2299,42 @@ class SlackFrontend(Frontend):
             self._spent_menus[key] = None
             if len(self._spent_menus) > SUGGESTION_SPENT_CAP:
                 self._spent_menus.pop(next(iter(self._spent_menus)))
+        thread_ts = (body.get("message") or {}).get("thread_ts")
+        display = (body.get("user") or {}).get("name", "")
+        menu = f" [menu-ts: {ts}]" if ts else ""
+        # The operator's deny rule, checked here because this is the one point
+        # every `cotf-sugg:` button reaches, whoever drew it. A refused tap
+        # returns before any turn bookkeeping, so it costs no budget and pairs
+        # with no reaction; the menu is still spent, so it cannot be re-tapped.
+        refusal = suggestion_deny.tap_refusal(label)
+        if refusal is not None:
+            await self._retire_suggestion_menu(body, label, mark="⊘")
+            # Never ` (button)`: a refused tap must not read as one that ran.
+            logger.info(
+                "slack %s/%s: %s%s %s (button refused)",
+                channel,
+                thread_ts or ts,
+                sender_marker(sender_id, display),
+                menu,
+                label,
+            )
+            logger.warning(
+                "%s: tap refused in %s/%s (%s)",
+                suggestion_deny.TAG,
+                channel,
+                thread_ts or ts,
+                refusal,
+            )
+            await self._post_notice(
+                channel, thread_ts or ts or None, suggestion_deny.REFUSAL_TEXT
+            )
+            return
         await self._retire_suggestion_menu(body, label)
         # A tap can arrive after a restart or a cap eviction emptied _sessions,
         # so the thread is registered here exactly as a typed message registers
         # it: the route, or send() has nowhere to reply, and the workspace, or
         # the turn runs in `slack/<session key>` instead of the conversation's
         # directory. The tap carries who pressed it, which is all a DM needs.
-        thread_ts = (body.get("message") or {}).get("thread_ts")
         if chat_id in self._workspace_names:
             self._remember_session(chat_id, channel, thread_ts)
         else:
@@ -2313,7 +2344,6 @@ class SlackFrontend(Frontend):
         # turn's reactions with its own message instead of the next one's.
         self._pending_msg.setdefault(chat_id, deque()).append((channel, ts))
         self._pending_reply_suppressed.setdefault(chat_id, deque()).append(False)
-        display = (body.get("user") or {}).get("name", "")
         # THE INBOUND LOG LINE, in the same shape and at the same moment a typed
         # message writes one: at dispatch, so a tap the gate above dropped leaves
         # no line, exactly as a dropped message leaves none.
@@ -2324,7 +2354,6 @@ class SlackFrontend(Frontend):
         # because the typed path already puts its own suffix there. The prefix
         # names the thread, as a typed line does; `menu-ts` names the menu the
         # tap answered, and is left out when the payload carries no message.
-        menu = f" [menu-ts: {ts}]" if ts else ""
         logger.info(
             "slack %s/%s: %s%s %s (button)",
             channel,
@@ -2338,7 +2367,23 @@ class SlackFrontend(Frontend):
         # thread's budget the same way, and is charged at the same point: a tap
         # queued behind a running turn must be counted before the next gate check.
         self._charge_turn(chat_id)
-        await self._on_message(chat_id, f"{sender_marker(sender_id, display)} {label}")
+        # Provenance rides in the turn's source-event block, not in the text: the
+        # dispatched text stays exactly what a tap has always sent, and the block
+        # says this turn was a tap on the menu at `ts`, not a message.
+        source_event = SourceEvent(
+            platform="slack",
+            channel_id=channel,
+            ts=ts,
+            thread_ts=thread_ts or ts,
+            text=label,
+            user=sender_id,
+            via="button",
+        )
+        await self._on_message(
+            chat_id,
+            f"{sender_marker(sender_id, display)} {label}",
+            source_event=source_event,
+        )
 
     async def _on_continue_action(self, body: dict) -> None:
         """Resume a gated thread from the gate notice's Continue button, and run
@@ -2500,8 +2545,14 @@ class SlackFrontend(Frontend):
         except Exception as exc:
             logger.warning("delete_ephemeral: could not reach response_url: %s", exc)
 
-    async def _retire_suggestion_menu(self, body: dict, label: str) -> None:
-        """Rewrite the clicked message, collapsing the menu to a status line."""
+    async def _retire_suggestion_menu(
+        self, body: dict, label: str, *, mark: str = "✓"
+    ) -> None:
+        """Rewrite the clicked message, collapsing the menu to a status line.
+
+        `mark` leads the line: ✓ for a pick that was sent, anything else for one
+        that was not, so a reader scrolling back never takes a refusal for a send.
+        """
         message = body.get("message") or {}
         channel = (body.get("channel") or {}).get("id", "")
         ts = message.get("ts", "")
@@ -2530,7 +2581,7 @@ class SlackFrontend(Frontend):
                 # for older messages still sitting in history with full-length
                 # text.
                 text=fit_text_field(message.get("text", "")),
-                blocks=_retire_suggestion_block(blocks, label),
+                blocks=_retire_suggestion_block(blocks, label, mark=mark),
             )
         except Exception as exc:
             # The label is routed regardless; only the cosmetic mark failed,

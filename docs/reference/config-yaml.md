@@ -457,9 +457,30 @@ taps. An invalid edit retains the last valid startup ID and logs an error.
 | Key | Type / default | Effect | Lifecycle |
 |---|---|---|---|
 | `enabled` | boolean / `false` | Ask the agent to end each chat reply with follow-up buttons instead of the static shortcut list | Next turn |
+| `deny_file` | absolute path / unset | JSON file `{"patterns": [regex, ...], "why": "..."}`; a matching label is never offered and a tap on one is refused | Next reply or tap (re-read when the file changes) |
 
 While enabled, the agent's own follow-up questions render as buttons and the static
 shortcut list is suppressed; a reply without a suggestions block shows no buttons at all.
+
+`deny_file` is matched against each label after NFKC normalisation, with the dash-like
+characters U+2010..2015, U+2212, U+FE58, U+FE63, U+FF0D and `_` folded to `-`; each
+pattern is applied with `re.search`. It is checked twice:
+
+- **Offer**: a matching label is dropped whole, before it is fitted to the button width
+  and before the buttons are drawn.
+- **Tap**: a matching label is not sent, whoever posted the button. The menu collapses
+  to `⊘ <label>` rather than `✓`, one line in the thread says the button was disabled,
+  and the log line ends in `(button refused)` instead of `(button)`. The refused tap
+  does not count against the thread's reply budget.
+
+A configured file that cannot be used (missing, not JSON, not that shape, an empty
+`patterns` list, a pattern that does not compile, or a path that is not absolute) is logged at ERROR, once per
+state. Until it is fixed every tap is refused and no offered label is dropped. Every
+drop and refusal is logged with the prefix `suggestion-deny: `.
+
+A tap now also marks its turn: the `<cotf-source-event>` block carries `"via": "button"`,
+the menu message's `ts`, and the label as `text`, with `is_original_event` false. The
+text sent to the agent is unchanged.
 
 ## `jobs`
 

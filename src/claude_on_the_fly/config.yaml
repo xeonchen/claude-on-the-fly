@@ -721,6 +721,15 @@ suggestions:
   # keyboard). Costs a few dozen extra tokens per turn; when the agent does not
   # emit the block, no buttons are shown. Off by default.
   # enabled: true
+  #
+  # Absolute path to a JSON file, {"patterns": [regex, ...], "why": "..."}. A label
+  # matching any pattern (after NFKC and folding dash-like characters and `_` to
+  # `-`) is never drawn as a button, and a tap on one is not sent: the menu is
+  # retired with a ⊘ and one line in the thread says so. Re-read when the file
+  # changes. If the file cannot be used (missing, bad JSON, an empty pattern
+  # list, a pattern that does not compile, a relative path), every tap is refused
+  # until it is fixed. Unset: no filtering.
+  # deny_file: /absolute/path/to/suggestion-deny.json
 
 jobs:
   # Queue adapter shared by the worker and the producers. Needs a restart: the
