@@ -685,7 +685,11 @@ SUGGESTION_SPENT_CAP = 500
 # The one line a presser sees, only them, for a press that dispatched nothing.
 PRESS_NOT_COUNTED = {
     "duplicate": "This press was not counted: it repeats an earlier press.",
-    "ledger-write-failed": "This press was not counted: it could not be recorded.",
+    # Unlike the other two, this press did reach the agent: only its record is
+    # in doubt (a failed fsync can leave the bytes written).
+    "ledger-write-failed": (
+        "This press was passed on, but it may not have been recorded."
+    ),
     "rate-limited": (
         "This press was not counted: too many presses in a minute, press again shortly."
     ),
@@ -2394,9 +2398,11 @@ class SlackFrontend(Frontend):
                 )
             )
 
-        # Everything from here to the ledger append is synchronous, so two
-        # presses delivered in the same event-loop tick cannot both pass: the
-        # first marks the key before the second is looked at.
+        # The key is checked and marked before the first `await`, so two
+        # presses delivered together cannot both pass: the second finds the
+        # first's mark even when the first is suspended later (registering an
+        # unknown thread, below). From the ledger append to the dispatch nothing
+        # awaits.
         key = (channel, ts, block_id)
         if channel and ts:
             if key in self._spent_menus or self._press_ledger.has(key):
