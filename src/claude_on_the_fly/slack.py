@@ -29,7 +29,7 @@ from slack_sdk.http_retry.builtin_async_handlers import (
 )
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
-from claude_on_the_fly import checks, logs, settings, suggestion_deny
+from claude_on_the_fly import button_presses, checks, logs, settings, suggestion_deny
 from claude_on_the_fly.agent import (
     DATA_DIR,
     MAX_ATTACHMENT_BYTES,
@@ -680,7 +680,15 @@ def _bot_policy_decision(
 JOB_LIST_LIMIT = 10
 # Cap on remembered tapped suggestion menus. A tap usually retires the menu, so
 # the spent set only grows on marks that failed; the cap bounds it regardless.
+# An evicted press is still a duplicate: the press ledger remembers it.
 SUGGESTION_SPENT_CAP = 500
+# The one line a presser sees, only them, for a press that dispatched nothing.
+PRESS_NOT_COUNTED = {
+    "duplicate": "This press was not counted: it repeats an earlier press.",
+    "rate-limited": (
+        "This press was not counted: too many presses in a minute, press again shortly."
+    ),
+}
 # Prompt characters per listed row. Long enough to recognise the job you asked
 # for, short enough that ten of them stay one screen.
 JOB_LIST_PROMPT_CHARS = 80
@@ -912,27 +920,43 @@ def _mention_notice_blocks(
 
 
 def _retire_suggestion_block(
-    blocks: list[dict], label: str, *, mark: str = "✓"
+    blocks: list[dict],
+    label: str,
+    *,
+    mark: str = "✓",
+    block_id: str = "",
+    display: str = "",
 ) -> list[dict]:
-    """Rebuild message blocks with the suggestion menu collapsed to a status line.
+    """Rebuild message blocks with the pressed menu collapsed to a status line.
 
-    The whole menu goes on any tap, not just the tapped button: a second click
-    must not send a second message. The context block keeps the ✓ pick visible
-    in the chat as history. The label is the clicked button's own text rather
-    than something parsed out of the message body, so agent-rendered content
-    is never re-read out of the payload.
+    The whole pressed block goes on a tap, not just the tapped button: a second
+    click must not send a second message. With `block_id`, only that actions
+    block retires, and its status line keeps the id as `cotf-retired:<block_id>`
+    so a reader can tell which menu was answered; other menus on the message stay
+    live. Without one (or when no block carries it), every actions block retires,
+    as before. The context block keeps the ✓ pick, and who made it, visible in
+    the chat as history. The label is the clicked button's own text rather than
+    something parsed out of the message body, so agent-rendered content is never
+    re-read out of the payload.
     """
+    text = f"{mark} {label} ({display})" if display else f"{mark} {label}"
+    targeted = bool(block_id) and any(
+        b.get("type") == "actions" and b.get("block_id") == block_id for b in blocks
+    )
     retired: list[dict] = []
     for block in blocks:
-        if block.get("type") != "actions":
+        if block.get("type") != "actions" or (
+            targeted and block.get("block_id") != block_id
+        ):
             retired.append(block)
             continue
-        retired.append(
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"{mark} {label}"}],
-            }
-        )
+        status: dict = {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": text}],
+        }
+        if targeted:
+            status["block_id"] = f"cotf-retired:{block_id}"
+        retired.append(status)
     return retired
 
 
@@ -1434,6 +1458,8 @@ class SlackFrontend(Frontend):
         self._watermarks_cache: tuple[Path, SlackWatermarks] | None = None
         self._watermarks_restored = False
         self._failed_events_cache: tuple[Path, FailedSlackEvents] | None = None
+        self._press_ledger_cache: tuple[Path, button_presses.PressLedger] | None = None
+        self._press_rate = button_presses.PressRateLimit()
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
         # (channel_id, thread_ts) -> last event_ts. History omits thread replies.
         self._active_threads: dict[tuple[str, str], str] = {}
@@ -1465,10 +1491,11 @@ class SlackFrontend(Frontend):
             int, deque[tuple[str, str]]
         ] = {}  # session -> FIFO of (channel, ts)
         self._pending_reply_suppressed: dict[int, deque[bool]] = {}
-        # (channel, ts) -> None for suggestion menus already tapped. The menu
-        # retire is a cosmetic chat_update that can fail; this is the
-        # synchronous guard that actually stops a re-tap from sending twice.
-        self._spent_menus: dict[tuple[str, str], None] = {}
+        # (channel, ts, block_id) -> None for suggestion menus already tapped.
+        # The menu retire is a chat_update that can fail; this is the
+        # synchronous guard that stops a re-tap from sending twice, and the press
+        # ledger is its durable half across a restart or a cap eviction.
+        self._spent_menus: dict[tuple[str, str, str], None] = {}
         self._in_flight: dict[int, tuple[str, str]] = {}
         self._in_flight_reply_suppressed: dict[int, bool] = {}
         # session -> (channel, ts, body) of the running turn's progress messages,
@@ -1612,6 +1639,33 @@ class SlackFrontend(Frontend):
             cached = (path, SlackWatermarks(path))
             self._watermarks_cache = cached
         return cached[1]
+
+    @property
+    def _press_ledger(self) -> button_presses.PressLedger:
+        """Counted button presses, one JSON line each, surviving a restart."""
+        path = DATA_DIR / "state" / button_presses.LEDGER_NAME
+        cached = self._press_ledger_cache
+        if cached is None or cached[0] != path:
+            cached = (path, button_presses.PressLedger(path))
+            self._press_ledger_cache = cached
+        return cached[1]
+
+    def _open_press_ledger(self) -> None:
+        """Create the press ledger if absent, then write the start-up marker.
+
+        The marker is written only once the ledger exists, so its presence says
+        this running process records presses. A failure here costs the ledger,
+        never the connection: presses still dispatch, and each one logs a
+        `ledger-write-failed` drop line.
+        """
+        try:
+            self._press_ledger.ensure()
+            button_presses.write_marker(
+                DATA_DIR / "state" / button_presses.MARKER_NAME,
+                ledger_name=button_presses.LEDGER_NAME,
+            )
+        except OSError as exc:
+            logger.error("press ledger: cannot open at start: %s", exc)
 
     @property
     def _failed_events(self) -> FailedSlackEvents:
@@ -1974,6 +2028,7 @@ class SlackFrontend(Frontend):
 
     async def start(self, on_message: IncomingMessageHandler) -> None:
         self._on_message = on_message
+        self._open_press_ledger()
 
         @self._app.event({"type": "message"})
         async def handle_message(event):
@@ -2284,22 +2339,46 @@ class SlackFrontend(Frontend):
             return
         chat_id = self._session_id_for(body)
         channel = (body.get("channel") or {}).get("id", "")
-        # Slack gives a clicked button no selected state, so the menu is
-        # retired on any tap: the whole actions block collapses to a status
-        # line, so nothing on it can be clicked twice, and the ✓ names the
-        # pick for anyone scrolling back. The retire is cosmetic and can fail
-        # (a transient API error, a dropped scope), so the spent set below is
-        # what actually enforces one tap, one message.
-        ts = (body.get("message") or {}).get("ts", "")
+        # Slack gives a clicked button no selected state, so the pressed menu
+        # is retired on any tap: its actions block collapses to a status line,
+        # so nothing on it can be clicked twice, and the ✓ names the pick and
+        # who made it for anyone scrolling back. The retire can fail (a
+        # transient API error, a dropped scope), so the spent set and the press
+        # ledger below are what actually enforce one press, one message.
+        message = body.get("message") or {}
+        ts = message.get("ts", "")
+        action = actions[0]
+        block_id = action.get("block_id", "")
+        action_ts = action.get("action_ts", "")
+        response_url = body.get("response_url", "")
+
+        def drop(reason: str) -> None:
+            logger.warning(
+                button_presses.drop_line(
+                    reason,
+                    channel=channel,
+                    message_ts=ts,
+                    block_id=block_id,
+                    action_ts=action_ts,
+                    user=sender_id,
+                )
+            )
+
+        # Everything from here to the ledger append is synchronous, so two
+        # presses delivered in the same event-loop tick cannot both pass: the
+        # first marks the key before the second is looked at.
+        key = (channel, ts, block_id)
         if channel and ts:
-            key = (channel, ts)
-            if key in self._spent_menus:
-                logger.info("slack: suggestion on %s already spent, dropping", key)
+            if key in self._spent_menus or self._press_ledger.has(key):
+                drop("duplicate")
+                await self._respond_ephemeral(
+                    response_url, PRESS_NOT_COUNTED["duplicate"]
+                )
                 return
             self._spent_menus[key] = None
             if len(self._spent_menus) > SUGGESTION_SPENT_CAP:
                 self._spent_menus.pop(next(iter(self._spent_menus)))
-        thread_ts = (body.get("message") or {}).get("thread_ts")
+        thread_ts = message.get("thread_ts")
         display = (body.get("user") or {}).get("name", "")
         menu = f" [menu-ts: {ts}]" if ts else ""
         # The operator's deny rule, checked here because this is the one point
@@ -2308,7 +2387,9 @@ class SlackFrontend(Frontend):
         # with no reaction; the menu is still spent, so it cannot be re-tapped.
         refusal = suggestion_deny.tap_refusal(label)
         if refusal is not None:
-            await self._retire_suggestion_menu(body, label, mark="⊘")
+            await self._retire_suggestion_menu(
+                body, label, mark="⊘", block_id=block_id, display=display
+            )
             # Never ` (button)`: a refused tap must not read as one that ran.
             logger.info(
                 "slack %s/%s: %s%s %s (button refused)",
@@ -2329,7 +2410,46 @@ class SlackFrontend(Frontend):
                 channel, thread_ts or ts or None, suggestion_deny.REFUSAL_TEXT
             )
             return
-        await self._retire_suggestion_menu(body, label)
+        if not self._press_rate.allow(sender_id):
+            # Unspent again, still before any await, so the same press can be
+            # made once the window has room; the menu is left as it was.
+            self._spent_menus.pop(key, None)
+            drop("rate-limited")
+            await self._respond_ephemeral(
+                response_url, PRESS_NOT_COUNTED["rate-limited"]
+            )
+            return
+        try:
+            self._press_ledger.append(
+                {
+                    "v": button_presses.LEDGER_VERSION,
+                    "press_id": uuid4().hex,
+                    "action_ts": action_ts,
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                    "team_id": (body.get("team") or {}).get("id", ""),
+                    "api_app_id": body.get("api_app_id", ""),
+                    "user_id": sender_id,
+                    "display": display,
+                    "channel": channel,
+                    "message_ts": ts,
+                    "thread_ts": thread_ts or ts,
+                    "message_user": message.get("user", ""),
+                    "message_bot_id": message.get("bot_id", ""),
+                    "block_id": block_id,
+                    "action_id": action.get("action_id", ""),
+                    "value": action.get("value", ""),
+                    "label": label,
+                }
+            )
+        except (OSError, ValueError) as exc:
+            # The press still dispatches: losing the record must not lose the
+            # answer. The drop line says the record is missing.
+            logger.warning("press ledger: could not record press: %s", exc)
+            drop("ledger-write-failed")
+        if not await self._retire_suggestion_menu(
+            body, label, block_id=block_id, display=display
+        ):
+            drop("retire-failed")
         # A tap can arrive after a restart or a cap eviction emptied _sessions,
         # so the thread is registered here exactly as a typed message registers
         # it: the route, or send() has nowhere to reply, and the workspace, or
@@ -2545,13 +2665,51 @@ class SlackFrontend(Frontend):
         except Exception as exc:
             logger.warning("delete_ephemeral: could not reach response_url: %s", exc)
 
+    async def _respond_ephemeral(self, response_url: str, text: str) -> None:
+        """Answer a press with one line only the presser sees.
+
+        Through the interaction's `response_url`, under the app's own identity,
+        with `replace_original` off so the message pressed stays as it is.
+        Best-effort and logged on failure, like `_delete_ephemeral`.
+        """
+        if not response_url:
+            logger.warning("respond_ephemeral: no response_url on the payload")
+            return
+        payload = {
+            "response_type": "ephemeral",
+            "replace_original": False,
+            "text": text,
+        }
+        try:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.post(response_url, json=payload) as resp,
+            ):
+                if resp.status >= 400:
+                    logger.warning(
+                        "respond_ephemeral: response_url returned %s: %s",
+                        resp.status,
+                        await resp.text(),
+                    )
+        except Exception as exc:
+            logger.warning("respond_ephemeral: could not reach response_url: %s", exc)
+
     async def _retire_suggestion_menu(
-        self, body: dict, label: str, *, mark: str = "✓"
-    ) -> None:
-        """Rewrite the clicked message, collapsing the menu to a status line.
+        self,
+        body: dict,
+        label: str,
+        *,
+        mark: str = "✓",
+        block_id: str = "",
+        display: str = "",
+    ) -> bool:
+        """Rewrite the clicked message, collapsing the pressed menu to a status line.
 
         `mark` leads the line: ✓ for a pick that was sent, anything else for one
         that was not, so a reader scrolling back never takes a refusal for a send.
+        Returns whether the pressed block was retired as asked: False when the
+        payload was incomplete, the update failed, or no block carried
+        `block_id` (the whole menu then retires instead).
         """
         message = body.get("message") or {}
         channel = (body.get("channel") or {}).get("id", "")
@@ -2568,7 +2726,10 @@ class SlackFrontend(Frontend):
                 ts,
                 "yes" if blocks else "no",
             )
-            return
+            return False
+        targeted = not block_id or any(
+            b.get("type") == "actions" and b.get("block_id") == block_id for b in blocks
+        )
         try:
             await self._app.client.chat_update(
                 channel=channel,
@@ -2581,12 +2742,16 @@ class SlackFrontend(Frontend):
                 # for older messages still sitting in history with full-length
                 # text.
                 text=fit_text_field(message.get("text", "")),
-                blocks=_retire_suggestion_block(blocks, label, mark=mark),
+                blocks=_retire_suggestion_block(
+                    blocks, label, mark=mark, block_id=block_id, display=display
+                ),
             )
         except Exception as exc:
-            # The label is routed regardless; only the cosmetic mark failed,
-            # and the spent set keeps a re-tap from dispatching twice.
+            # The label is routed regardless; only the mark failed, and the
+            # spent set keeps a re-tap from dispatching twice.
             logger.warning("slack: could not retire suggestion menu: %s", exc)
+            return False
+        return targeted
 
     def _session_id_for(self, body: dict) -> int:
         """The chat whose thread a button lives in.
