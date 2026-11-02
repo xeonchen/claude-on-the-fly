@@ -685,6 +685,7 @@ SUGGESTION_SPENT_CAP = 500
 # The one line a presser sees, only them, for a press that dispatched nothing.
 PRESS_NOT_COUNTED = {
     "duplicate": "This press was not counted: it repeats an earlier press.",
+    "ledger-write-failed": "This press was not counted: it could not be recorded.",
     "rate-limited": (
         "This press was not counted: too many presses in a minute, press again shortly."
     ),
@@ -926,6 +927,7 @@ def _retire_suggestion_block(
     mark: str = "✓",
     block_id: str = "",
     display: str = "",
+    note: str = "",
 ) -> list[dict]:
     """Rebuild message blocks with the pressed menu collapsed to a status line.
 
@@ -940,6 +942,8 @@ def _retire_suggestion_block(
     re-read out of the payload.
     """
     text = f"{mark} {label} ({display})" if display else f"{mark} {label}"
+    if note:
+        text = f"{text} — {note}"
     targeted = bool(block_id) and any(
         b.get("type") == "actions" and b.get("block_id") == block_id for b in blocks
     )
@@ -1650,6 +1654,31 @@ class SlackFrontend(Frontend):
             self._press_ledger_cache = cached
         return cached[1]
 
+    @property
+    def _press_marker(self) -> Path:
+        return DATA_DIR / "state" / button_presses.MARKER_NAME
+
+    def _record_press(self, record: dict) -> bool:
+        """Append one press to the ledger; False when it was not recorded.
+
+        A press with no channel or message ts has nothing to be keyed on and is
+        not recorded. A failed write also withdraws the start-up marker, so a
+        reader stops trusting a ledger that has stopped recording until a
+        restart proves it writable again.
+        """
+        if not (record["channel"] and record["message_ts"]):
+            return False
+        try:
+            self._press_ledger.append(record)
+        except ValueError as exc:
+            logger.warning("press ledger: could not record press: %s", exc)
+            return False
+        except OSError as exc:
+            logger.warning("press ledger: could not record press: %s", exc)
+            button_presses.withdraw_marker(self._press_marker)
+            return False
+        return True
+
     def _open_press_ledger(self) -> None:
         """Create the press ledger if absent, then write the start-up marker.
 
@@ -1658,11 +1687,12 @@ class SlackFrontend(Frontend):
         never the connection: presses still dispatch, and each one logs a
         `ledger-write-failed` drop line.
         """
+        # An old marker goes first, so a failure below leaves none behind.
+        button_presses.withdraw_marker(self._press_marker)
         try:
             self._press_ledger.ensure()
             button_presses.write_marker(
-                DATA_DIR / "state" / button_presses.MARKER_NAME,
-                ledger_name=button_presses.LEDGER_NAME,
+                self._press_marker, ledger_name=button_presses.LEDGER_NAME
             )
         except OSError as exc:
             logger.error("press ledger: cannot open at start: %s", exc)
@@ -2419,37 +2449,6 @@ class SlackFrontend(Frontend):
                 response_url, PRESS_NOT_COUNTED["rate-limited"]
             )
             return
-        try:
-            self._press_ledger.append(
-                {
-                    "v": button_presses.LEDGER_VERSION,
-                    "press_id": uuid4().hex,
-                    "action_ts": action_ts,
-                    "recorded_at": datetime.now(UTC).isoformat(),
-                    "team_id": (body.get("team") or {}).get("id", ""),
-                    "api_app_id": body.get("api_app_id", ""),
-                    "user_id": sender_id,
-                    "display": display,
-                    "channel": channel,
-                    "message_ts": ts,
-                    "thread_ts": thread_ts or ts,
-                    "message_user": message.get("user", ""),
-                    "message_bot_id": message.get("bot_id", ""),
-                    "block_id": block_id,
-                    "action_id": action.get("action_id", ""),
-                    "value": action.get("value", ""),
-                    "label": label,
-                }
-            )
-        except (OSError, ValueError) as exc:
-            # The press still dispatches: losing the record must not lose the
-            # answer. The drop line says the record is missing.
-            logger.warning("press ledger: could not record press: %s", exc)
-            drop("ledger-write-failed")
-        if not await self._retire_suggestion_menu(
-            body, label, block_id=block_id, display=display
-        ):
-            drop("retire-failed")
         # A tap can arrive after a restart or a cap eviction emptied _sessions,
         # so the thread is registered here exactly as a typed message registers
         # it: the route, or send() has nowhere to reply, and the workspace, or
@@ -2464,6 +2463,32 @@ class SlackFrontend(Frontend):
         # turn's reactions with its own message instead of the next one's.
         self._pending_msg.setdefault(chat_id, deque()).append((channel, ts))
         self._pending_reply_suppressed.setdefault(chat_id, deque()).append(False)
+        # From the append to the dispatch nothing awaits, so a stop or a crash
+        # cannot leave a recorded press that never reached the agent; the
+        # retire, the one slow Slack call, goes last.
+        recorded = self._record_press(
+            {
+                "v": button_presses.LEDGER_VERSION,
+                "press_id": uuid4().hex,
+                "action_ts": action_ts,
+                "recorded_at": datetime.now(UTC).isoformat(),
+                "team_id": (body.get("team") or {}).get("id", ""),
+                "api_app_id": body.get("api_app_id", ""),
+                "user_id": sender_id,
+                "display": display,
+                "channel": channel,
+                "message_ts": ts,
+                "thread_ts": thread_ts or ts,
+                "message_user": message.get("user", ""),
+                "message_bot_id": message.get("bot_id", ""),
+                "block_id": block_id,
+                "action_id": action.get("action_id", ""),
+                "value": action.get("value", ""),
+                "label": label,
+            }
+        )
+        if not recorded:
+            drop("ledger-write-failed")
         # THE INBOUND LOG LINE, in the same shape and at the same moment a typed
         # message writes one: at dispatch, so a tap the gate above dropped leaves
         # no line, exactly as a dropped message leaves none.
@@ -2504,6 +2529,19 @@ class SlackFrontend(Frontend):
             f"{sender_marker(sender_id, display)} {label}",
             source_event=source_event,
         )
+        if not recorded:
+            await self._respond_ephemeral(
+                response_url, PRESS_NOT_COUNTED["ledger-write-failed"]
+            )
+        if not await self._retire_suggestion_menu(
+            body,
+            label,
+            mark="✓" if recorded else "⚠",
+            note="" if recorded else "not recorded",
+            block_id=block_id,
+            display=display,
+        ):
+            drop("retire-failed")
 
     async def _on_continue_action(self, body: dict) -> None:
         """Resume a gated thread from the gate notice's Continue button, and run
@@ -2702,6 +2740,7 @@ class SlackFrontend(Frontend):
         mark: str = "✓",
         block_id: str = "",
         display: str = "",
+        note: str = "",
     ) -> bool:
         """Rewrite the clicked message, collapsing the pressed menu to a status line.
 
@@ -2709,7 +2748,8 @@ class SlackFrontend(Frontend):
         that was not, so a reader scrolling back never takes a refusal for a send.
         Returns whether the pressed block was retired as asked: False when the
         payload was incomplete, the update failed, or no block carried
-        `block_id` (the whole menu then retires instead).
+        `block_id`. In that last case nothing is retired: collapsing every menu
+        would put a check on menus nobody answered.
         """
         message = body.get("message") or {}
         channel = (body.get("channel") or {}).get("id", "")
@@ -2727,9 +2767,15 @@ class SlackFrontend(Frontend):
                 "yes" if blocks else "no",
             )
             return False
-        targeted = not block_id or any(
+        if block_id and not any(
             b.get("type") == "actions" and b.get("block_id") == block_id for b in blocks
-        )
+        ):
+            logger.warning(
+                "slack: cannot retire suggestion menu, no block %r on %s",
+                block_id,
+                ts,
+            )
+            return False
         try:
             await self._app.client.chat_update(
                 channel=channel,
@@ -2743,7 +2789,12 @@ class SlackFrontend(Frontend):
                 # text.
                 text=fit_text_field(message.get("text", "")),
                 blocks=_retire_suggestion_block(
-                    blocks, label, mark=mark, block_id=block_id, display=display
+                    blocks,
+                    label,
+                    mark=mark,
+                    block_id=block_id,
+                    display=display,
+                    note=note,
                 ),
             )
         except Exception as exc:
@@ -2751,7 +2802,7 @@ class SlackFrontend(Frontend):
             # spent set keeps a re-tap from dispatching twice.
             logger.warning("slack: could not retire suggestion menu: %s", exc)
             return False
-        return targeted
+        return True
 
     def _session_id_for(self, body: dict) -> int:
         """The chat whose thread a button lives in.

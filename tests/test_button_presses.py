@@ -85,6 +85,66 @@ class TestPressLedger:
     def test_a_missing_ledger_reads_as_empty(self, tmp_path):
         assert not PressLedger(tmp_path / "absent.jsonl").has(("C1", "1", "b"))
 
+    def test_ensure_proves_an_existing_ledger_is_writable(self, tmp_path):
+        path = tmp_path / "presses.jsonl"
+        path.write_text("")
+        path.chmod(0o400)
+        try:
+            with pytest.raises(PermissionError):
+                PressLedger(path).ensure()
+        finally:
+            path.chmod(0o600)
+
+    def test_a_line_separator_in_a_label_survives_a_restart(self, tmp_path):
+        path = tmp_path / "presses.jsonl"
+        PressLedger(path).append(_record(label="ok\u2028done\u2029\x85"))
+        raw = path.read_bytes()
+        assert raw.isascii() and raw.count(b"\n") == 1
+        assert PressLedger(path).has(("C1", "99.1", "menu-a"))
+
+    def test_a_raw_line_separator_from_another_writer_is_not_a_line_break(
+        self, tmp_path
+    ):
+        path = tmp_path / "presses.jsonl"
+        line = json.dumps(_record(label="ok\u2028done"), ensure_ascii=False)
+        path.write_text(line + "\n", encoding="utf-8")
+        assert PressLedger(path).has(("C1", "99.1", "menu-a"))
+
+    def test_a_torn_tail_does_not_swallow_the_next_press(self, tmp_path):
+        path = tmp_path / "presses.jsonl"
+        path.write_text('{"channel": "C1", "message_ts": "1.0", "blo')
+        PressLedger(path).append(_record())
+        assert PressLedger(path).has(("C1", "99.1", "menu-a"))
+
+    def test_a_short_write_is_finished(self, tmp_path, monkeypatch):
+        real_write = os.write
+        calls = []
+
+        def short(fd, data):
+            calls.append(len(data))
+            return real_write(fd, data[: max(1, len(data) // 2)])
+
+        monkeypatch.setattr(button_presses.os, "write", short)
+        path = tmp_path / "presses.jsonl"
+        PressLedger(path).append(_record())
+        monkeypatch.undo()
+        assert len(calls) > 1
+        assert PressLedger(path).has(("C1", "99.1", "menu-a"))
+
+    def test_a_write_that_makes_no_progress_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(button_presses.os, "write", lambda fd, data: 0)
+        with pytest.raises(OSError, match="no progress"):
+            PressLedger(tmp_path / "presses.jsonl").append(_record())
+
+    def test_an_unreadable_ledger_is_read_again_later(self, tmp_path):
+        path = tmp_path / "presses.jsonl"
+        path.mkdir()
+        ledger = PressLedger(path)
+        assert not ledger.has(("C1", "99.1", "menu-a"))
+        path.rmdir()
+        path.write_text(json.dumps(_record()) + "\n")
+        assert ledger.has(("C1", "99.1", "menu-a"))
+
     def test_a_failed_append_raises_and_records_no_key(self, tmp_path):
         path = tmp_path / "presses.jsonl"
         path.mkdir()
@@ -207,6 +267,18 @@ class TestDropLine:
         assert "\n" not in line
         assert line.count("[user: ") == 1
         assert "[action-ts: -]" in line
+
+    def test_no_control_or_separator_character_reaches_the_line(self):
+        line = drop_line(
+            "duplicate",
+            channel="C1\u2028(button duplicate)",
+            message_ts="99.1\x85",
+            block_id="b\u2029\x00\t",
+            action_ts="1",
+            user="U1",
+        )
+        assert line.splitlines() == [line]
+        assert all(ch.isprintable() or ch == " " for ch in line)
 
     def test_only_the_four_reasons_exist(self):
         assert button_presses.DROP_REASONS == (

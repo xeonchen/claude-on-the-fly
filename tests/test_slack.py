@@ -5281,6 +5281,8 @@ class TestSuggestionActions:
             "actions": [
                 {
                     "action_id": action_id,
+                    # Slack stamps every block_actions action with its own ts.
+                    "action_ts": "100.1",
                     "text": {"type": "plain_text", "text": label},
                 }
             ],
@@ -8769,6 +8771,14 @@ NOT_COUNTED_DUPLICATE = "This press was not counted: it repeats an earlier press
 NOT_COUNTED_RATE = (
     "This press was not counted: too many presses in a minute, press again shortly."
 )
+NOT_COUNTED_UNRECORDED = "This press was not counted: it could not be recorded."
+
+
+async def _yield(*args, **kwargs):
+    """An awaited Slack call or dispatch that really suspends, so two presses
+    started together interleave the way they would on a live event loop."""
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
 
 class TestButtonPressLedger:
@@ -8957,12 +8967,61 @@ class TestButtonPressLedger:
         assert len(self._lines()) == 1
 
     async def test_two_presses_in_the_same_tick_write_one_line(self, frontend):
+        frontend._app.client.chat_update = AsyncMock(side_effect=_yield)
+        frontend._on_message.side_effect = _yield
+        frontend._respond_ephemeral = AsyncMock(side_effect=_yield)
         await asyncio.gather(
             frontend._on_suggestion_action(self._press()),
             frontend._on_suggestion_action(self._press(action_ts="100.3")),
         )
         assert len(self._lines()) == 1
         frontend._on_message.assert_awaited_once()
+
+    async def test_two_presses_in_the_same_tick_dispatch_once_without_a_ledger(
+        self, frontend
+    ):
+        # With the ledger write failing, the in-memory spent mark is the only
+        # guard left, so it must be taken before the first suspension.
+        self._ledger_path().parent.mkdir(parents=True, exist_ok=True)
+        self._ledger_path().mkdir()
+        frontend._app.client.chat_update = AsyncMock(side_effect=_yield)
+        frontend._on_message.side_effect = _yield
+        frontend._respond_ephemeral = AsyncMock(side_effect=_yield)
+        await asyncio.gather(
+            frontend._on_suggestion_action(self._press()),
+            frontend._on_suggestion_action(self._press(action_ts="100.3")),
+        )
+        frontend._on_message.assert_awaited_once()
+
+    async def test_the_press_dispatches_right_after_the_append_and_retires_last(
+        self, frontend
+    ):
+        order: list[str] = []
+        ledger = frontend._press_ledger
+        real_append = ledger.append
+
+        def append(record):
+            order.append("append")
+            real_append(record)
+
+        async def enter(*args, **kwargs):
+            order.append("session")
+
+        async def dispatch(*args, **kwargs):
+            order.append("dispatch")
+
+        async def retire(**kwargs):
+            order.append("retire")
+
+        ledger.append = append
+        frontend._sessions.clear()
+        frontend._enter_command_session = enter
+        frontend._on_message.side_effect = dispatch
+        frontend._app.client.chat_update = AsyncMock(side_effect=retire)
+
+        await frontend._on_suggestion_action(self._press())
+
+        assert order == ["session", "append", "dispatch", "retire"]
 
     async def test_the_seventh_press_in_a_minute_is_rate_limited(
         self, frontend, caplog
@@ -9023,16 +9082,25 @@ class TestButtonPressLedger:
         assert frontend._on_message.await_count == 2
         assert [line["block_id"] for line in self._lines()] == ["menu-a", "menu-b"]
 
-    async def test_a_press_whose_block_is_missing_retires_the_whole_menu(
+    async def test_a_press_whose_block_is_missing_retires_nothing(
         self, frontend, caplog
     ):
-        body = self._press(block_id="menu-gone", blocks=("menu-a",))
+        # Retiring every menu would put a false check on menus nobody answered.
+        body = self._press(block_id="menu-gone", blocks=("menu-a", "menu-b"))
         with caplog.at_level(logging.INFO):
             await frontend._on_suggestion_action(body)
-        blocks = frontend._app.client.chat_update.await_args.kwargs["blocks"]
-        assert all(b["type"] != "actions" for b in blocks)
+        frontend._app.client.chat_update.assert_not_awaited()
         assert len(self._drops(caplog, "retire-failed")) == 1
         frontend._on_message.assert_awaited_once()
+
+    async def test_a_press_without_a_message_records_no_line(self, frontend, caplog):
+        body = self._press()
+        del body["message"]
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(body)
+            await frontend._on_suggestion_action(body)
+        assert self._lines() == []
+        assert len(self._drops(caplog, "ledger-write-failed")) == 2
 
     async def test_a_ledger_write_failure_still_dispatches(self, frontend, caplog):
         self._ledger_path().parent.mkdir(parents=True, exist_ok=True)
@@ -9046,7 +9114,28 @@ class TestButtonPressLedger:
             "(button ledger-write-failed) [channel: C1] [menu-ts: 99.1] "
             "[block-id: menu-a] [action-ts: 100.2] [user: U_ALLOWED]"
         ]
-        frontend._respond_ephemeral.assert_not_awaited()
+        frontend._respond_ephemeral.assert_awaited_once_with(
+            "https://hooks.slack.test/actions/9", NOT_COUNTED_UNRECORDED
+        )
+
+    async def test_an_unrecorded_press_never_shows_a_check(self, frontend):
+        self._ledger_path().parent.mkdir(parents=True, exist_ok=True)
+        self._ledger_path().mkdir()
+        await frontend._on_suggestion_action(self._press())
+        blocks = frontend._app.client.chat_update.await_args.kwargs["blocks"]
+        status = next(b for b in blocks if b["type"] == "context")
+        assert status["elements"][0]["text"] == "⚠ alpha? (hoss) — not recorded"
+        assert status["block_id"] == "cotf-retired:menu-a"
+
+    async def test_a_failed_append_withdraws_the_marker(self, frontend):
+        frontend._open_press_ledger()
+        marker = self._ledger_path().parent / "slack.button-presses.marker.json"
+        assert marker.exists()
+        self._ledger_path().unlink()
+        self._ledger_path().mkdir()
+        await frontend._on_suggestion_action(self._press())
+        assert not marker.exists()
+        frontend._on_message.assert_awaited_once()
 
     async def test_a_press_without_action_ts_is_a_ledger_write_failure(
         self, frontend, caplog
@@ -9145,6 +9234,23 @@ class TestPressLedgerAtStart:
         (self._state() / "slack.button-presses.jsonl").mkdir()
         await self._start(frontend)
         assert not (self._state() / "slack.button-presses.marker.json").exists()
+
+    async def test_a_read_only_ledger_fails_at_start_and_drops_the_old_marker(
+        self, frontend, caplog
+    ):
+        self._state().mkdir(parents=True)
+        ledger = self._state() / "slack.button-presses.jsonl"
+        ledger.write_text("")
+        ledger.chmod(0o400)
+        marker = self._state() / "slack.button-presses.marker.json"
+        marker.write_text('{"pid": 1}')
+        try:
+            with caplog.at_level(logging.ERROR):
+                await self._start(frontend)
+        finally:
+            ledger.chmod(0o600)
+        assert not marker.exists()
+        assert "press ledger: cannot open" in caplog.text
 
 
 class TestRespondEphemeral:
