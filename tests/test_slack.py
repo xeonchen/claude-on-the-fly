@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import replace
@@ -5332,7 +5333,7 @@ class TestSuggestionActions:
         assert len(kwargs["text"].encode()) <= SLACK_TEXT_FIELD_BYTES
         assert kwargs["text"].endswith("…")
         status = next(b for b in kwargs["blocks"] if b["type"] == "context")
-        assert status["elements"][0]["text"] == "✓ alpha?"
+        assert status["elements"][0]["text"] == "✓ alpha? (hoss)"
 
     async def test_send_no_buttons_when_suggestions_empty(self, frontend):
         session_id = _session_key("C1", "t1")
@@ -5422,7 +5423,7 @@ class TestSuggestionActions:
         assert "alpha?" in text
         update = frontend._app.client.chat_update.await_args.kwargs
         status = next(b for b in update["blocks"] if b["type"] == "context")
-        assert status["elements"][0]["text"] == "✓ alpha?"
+        assert status["elements"][0]["text"] == "✓ alpha? (hoss)"
 
     async def test_tap_survives_a_restart_that_emptied_the_session_map(
         self, frontend
@@ -5472,7 +5473,7 @@ class TestSuggestionActions:
         assert update["ts"] == "99.1"
         assert all(b["type"] != "actions" for b in update["blocks"])
         status = next(b for b in update["blocks"] if b["type"] == "context")
-        assert status["elements"][0]["text"] == "✓ what can you do?"
+        assert status["elements"][0]["text"] == "✓ what can you do? (hoss)"
         frontend._on_message.assert_awaited_once()
 
     async def test_tap_without_message_blocks_skips_the_mark(self, frontend, caplog):
@@ -5533,13 +5534,13 @@ class TestSuggestionActions:
         frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
         frontend._app.client.chat_update = AsyncMock()
         for i in range(slack_mod.SUGGESTION_SPENT_CAP):
-            frontend._spent_menus[(f"C{i}", "1.0")] = None
+            frontend._spent_menus[(f"C{i}", "1.0", "")] = None
 
         await frontend._on_suggestion_action(self._tap())
 
         assert len(frontend._spent_menus) == slack_mod.SUGGESTION_SPENT_CAP
-        assert ("C0", "1.0") not in frontend._spent_menus
-        assert ("C1", "99.1") in frontend._spent_menus
+        assert ("C0", "1.0", "") not in frontend._spent_menus
+        assert ("C1", "99.1", "") in frontend._spent_menus
         frontend._on_message.assert_awaited_once()
 
 
@@ -5655,7 +5656,7 @@ class TestSuggestionDenyTap:
         frontend._on_message.assert_awaited_once()
         update = frontend._app.client.chat_update.await_args.kwargs
         status = next(b for b in update["blocks"] if b["type"] == "context")
-        assert status["elements"][0]["text"] == "✓ R12-ABCD-3X4"
+        assert status["elements"][0]["text"] == "✓ R12-ABCD-3X4 (hoss)"
 
 
 class TestSuggestionTapProvenance:
@@ -8762,3 +8763,435 @@ class TestCatchupReviewFixes:
         await frontend.stop()
 
         assert frontend._hello_task.cancelled()
+
+
+NOT_COUNTED_DUPLICATE = "This press was not counted: it repeats an earlier press."
+NOT_COUNTED_RATE = (
+    "This press was not counted: too many presses in a minute, press again shortly."
+)
+
+
+class TestButtonPressLedger:
+    """Tap provenance: one durable ledger line per counted press, one retired block
+    per press, a per-presser rate limit, and one structured log line per drop."""
+
+    @staticmethod
+    def _press(
+        *,
+        block_id: str = "menu-a",
+        blocks: tuple[str, ...] = ("menu-a",),
+        label: str = "alpha?",
+        user_id: str = "U_ALLOWED",
+        message_ts: str = "99.1",
+        action_ts: str = "100.2",
+    ) -> dict:
+        actions_blocks = [
+            {
+                "type": "actions",
+                "block_id": bid,
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": lbl},
+                        "action_id": f"cotf-sugg:{i}",
+                        "value": f"{bid}:{i}",
+                    }
+                    for i, lbl in enumerate(["alpha?", "beta?"])
+                ],
+            }
+            for bid in blocks
+        ]
+        return {
+            "type": "block_actions",
+            "team": {"id": "T1"},
+            "api_app_id": "A1",
+            "user": {"id": user_id, "name": "hoss"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/actions/9",
+            "message": {
+                "ts": message_ts,
+                "thread_ts": "t1",
+                "user": "U_BOT",
+                "bot_id": "B1",
+                "text": "hello",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "block_id": "body",
+                        "text": {"type": "mrkdwn", "text": "hello"},
+                    },
+                    *actions_blocks,
+                ],
+            },
+            "actions": [
+                {
+                    "action_id": "cotf-sugg:0",
+                    "block_id": block_id,
+                    "value": f"{block_id}:0",
+                    "action_ts": action_ts,
+                    "text": {"type": "plain_text", "text": label},
+                }
+            ],
+        }
+
+    @staticmethod
+    def _ledger_path():
+        return slack_mod.DATA_DIR / "state" / "slack.button-presses.jsonl"
+
+    def _lines(self) -> list[dict]:
+        path = self._ledger_path()
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    @pytest.fixture(autouse=True)
+    def _wired(self, frontend):
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+        frontend._respond_ephemeral = AsyncMock()
+
+    @staticmethod
+    def _drops(caplog, reason: str) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith(f"(button {reason}) ")
+        ]
+
+    async def test_a_press_writes_one_ledger_line_before_dispatch(self, frontend):
+        seen: list[list[dict]] = []
+        frontend._on_message.side_effect = lambda *a, **k: seen.append(self._lines())
+
+        await frontend._on_suggestion_action(self._press())
+
+        assert len(seen) == 1 and len(seen[0]) == 1, seen
+        line = seen[0][0]
+        assert line["v"] == 1
+        assert line["press_id"]
+        assert line["recorded_at"].endswith("+00:00")
+        assert {k: line[k] for k in line if k not in ("press_id", "recorded_at")} == {
+            "v": 1,
+            "action_ts": "100.2",
+            "team_id": "T1",
+            "api_app_id": "A1",
+            "user_id": "U_ALLOWED",
+            "display": "hoss",
+            "channel": "C1",
+            "message_ts": "99.1",
+            "thread_ts": "t1",
+            "message_user": "U_BOT",
+            "message_bot_id": "B1",
+            "block_id": "menu-a",
+            "action_id": "cotf-sugg:0",
+            "value": "menu-a:0",
+            "label": "alpha?",
+        }
+
+    async def test_the_presser_comes_from_the_payload_user(self, frontend):
+        body = self._press()
+        body["message"]["user"] = "U_SOMEONE_ELSE"
+        await frontend._on_suggestion_action(body)
+        assert self._lines()[0]["user_id"] == "U_ALLOWED"
+
+    async def test_a_disallowed_presser_writes_no_line(self, frontend):
+        await frontend._on_suggestion_action(self._press(user_id="U_STRANGER"))
+        assert self._lines() == []
+        frontend._on_message.assert_not_awaited()
+
+    async def test_a_denied_press_writes_no_line(self, frontend, deny_file):
+        await frontend._on_suggestion_action(self._press(label="R12-ABCD-3X4"))
+        assert self._lines() == []
+        frontend._on_message.assert_not_awaited()
+
+    async def test_a_press_needs_no_config_key(self, frontend, operator_settings):
+        operator_settings.write_text("")
+        await frontend._on_suggestion_action(self._press())
+        assert len(self._lines()) == 1
+
+    async def test_a_second_press_on_the_same_block_is_a_duplicate(
+        self, frontend, caplog
+    ):
+        frontend._app.client.chat_update = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "message_not_found"})
+        )
+        await frontend._on_suggestion_action(self._press())
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(self._press(action_ts="100.9"))
+
+        assert len(self._lines()) == 1
+        frontend._on_message.assert_awaited_once()
+        assert self._drops(caplog, "duplicate") == [
+            "(button duplicate) [channel: C1] [menu-ts: 99.1] [block-id: menu-a] "
+            "[action-ts: 100.9] [user: U_ALLOWED]"
+        ]
+        frontend._respond_ephemeral.assert_awaited_once_with(
+            "https://hooks.slack.test/actions/9", NOT_COUNTED_DUPLICATE
+        )
+
+    async def test_a_duplicate_after_a_restart_is_dropped(self, frontend, caplog):
+        await frontend._on_suggestion_action(self._press())
+        # A restart empties the in-memory spent set and the cached ledger reader;
+        # the ledger file is what remembers the press.
+        frontend._spent_menus.clear()
+        frontend._press_ledger_cache = None
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(self._press())
+
+        frontend._on_message.assert_awaited_once()
+        assert len(self._lines()) == 1
+        assert len(self._drops(caplog, "duplicate")) == 1
+
+    async def test_a_duplicate_after_the_spent_cap_evicted_it_is_dropped(
+        self, frontend
+    ):
+        await frontend._on_suggestion_action(self._press())
+        for i in range(slack_mod.SUGGESTION_SPENT_CAP + 1):
+            frontend._spent_menus[(f"C{i}", "1.0", "b")] = None
+            if len(frontend._spent_menus) > slack_mod.SUGGESTION_SPENT_CAP:
+                frontend._spent_menus.pop(next(iter(frontend._spent_menus)))
+        assert ("C1", "99.1", "menu-a") not in frontend._spent_menus
+
+        await frontend._on_suggestion_action(self._press())
+
+        frontend._on_message.assert_awaited_once()
+        assert len(self._lines()) == 1
+
+    async def test_two_presses_in_the_same_tick_write_one_line(self, frontend):
+        await asyncio.gather(
+            frontend._on_suggestion_action(self._press()),
+            frontend._on_suggestion_action(self._press(action_ts="100.3")),
+        )
+        assert len(self._lines()) == 1
+        frontend._on_message.assert_awaited_once()
+
+    async def test_the_seventh_press_in_a_minute_is_rate_limited(
+        self, frontend, caplog
+    ):
+        now = [5000.0]
+        frontend._press_rate._clock = lambda: now[0]
+        for i in range(6):
+            await frontend._on_suggestion_action(self._press(message_ts=f"9{i}.1"))
+        frontend._app.client.chat_update.reset_mock()
+
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(self._press(message_ts="97.1"))
+
+        assert len(self._lines()) == 6
+        assert frontend._on_message.await_count == 6
+        # The menu stays as it was, so the press can be made again.
+        frontend._app.client.chat_update.assert_not_awaited()
+        assert self._drops(caplog, "rate-limited") == [
+            "(button rate-limited) [channel: C1] [menu-ts: 97.1] [block-id: menu-a] "
+            "[action-ts: 100.2] [user: U_ALLOWED]"
+        ]
+        frontend._respond_ephemeral.assert_awaited_once_with(
+            "https://hooks.slack.test/actions/9", NOT_COUNTED_RATE
+        )
+
+        now[0] += 60.0
+        await frontend._on_suggestion_action(self._press(message_ts="97.1"))
+        assert len(self._lines()) == 7
+        assert frontend._on_message.await_count == 7
+
+    async def test_the_rate_limit_is_per_presser(self, frontend):
+        frontend._press_rate._clock = lambda: 1.0
+        frontend._is_allowed = lambda uid: uid in {"U_ALLOWED", "U_OTHER"}
+        for i in range(6):
+            await frontend._on_suggestion_action(self._press(message_ts=f"9{i}.1"))
+        await frontend._on_suggestion_action(
+            self._press(message_ts="97.1", user_id="U_OTHER")
+        )
+        assert frontend._on_message.await_count == 7
+
+    async def test_only_the_pressed_block_retires(self, frontend):
+        body = self._press(block_id="menu-a", blocks=("menu-a", "menu-b"))
+        await frontend._on_suggestion_action(body)
+
+        blocks = frontend._app.client.chat_update.await_args.kwargs["blocks"]
+        assert [b["type"] for b in blocks] == ["section", "context", "actions"]
+        assert blocks[1]["block_id"] == "cotf-retired:menu-a"
+        assert blocks[1]["elements"][0]["text"] == "✓ alpha? (hoss)"
+        assert blocks[2]["block_id"] == "menu-b"
+
+    async def test_the_other_block_on_the_same_message_still_works(self, frontend):
+        await frontend._on_suggestion_action(
+            self._press(block_id="menu-a", blocks=("menu-a", "menu-b"))
+        )
+        await frontend._on_suggestion_action(
+            self._press(block_id="menu-b", blocks=("menu-a", "menu-b"), label="beta?")
+        )
+        assert frontend._on_message.await_count == 2
+        assert [line["block_id"] for line in self._lines()] == ["menu-a", "menu-b"]
+
+    async def test_a_press_whose_block_is_missing_retires_the_whole_menu(
+        self, frontend, caplog
+    ):
+        body = self._press(block_id="menu-gone", blocks=("menu-a",))
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(body)
+        blocks = frontend._app.client.chat_update.await_args.kwargs["blocks"]
+        assert all(b["type"] != "actions" for b in blocks)
+        assert len(self._drops(caplog, "retire-failed")) == 1
+        frontend._on_message.assert_awaited_once()
+
+    async def test_a_ledger_write_failure_still_dispatches(self, frontend, caplog):
+        self._ledger_path().parent.mkdir(parents=True, exist_ok=True)
+        self._ledger_path().mkdir()
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(self._press())
+
+        frontend._on_message.assert_awaited_once()
+        assert "press ledger: could not record press" in caplog.text
+        assert self._drops(caplog, "ledger-write-failed") == [
+            "(button ledger-write-failed) [channel: C1] [menu-ts: 99.1] "
+            "[block-id: menu-a] [action-ts: 100.2] [user: U_ALLOWED]"
+        ]
+        frontend._respond_ephemeral.assert_not_awaited()
+
+    async def test_a_press_without_action_ts_is_a_ledger_write_failure(
+        self, frontend, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(self._press(action_ts=""))
+        assert self._lines() == []
+        assert len(self._drops(caplog, "ledger-write-failed")) == 1
+        frontend._on_message.assert_awaited_once()
+
+    async def test_a_retire_failure_logs_a_drop_line_and_dispatches(
+        self, frontend, caplog
+    ):
+        frontend._app.client.chat_update = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "message_not_found"})
+        )
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(self._press())
+
+        frontend._on_message.assert_awaited_once()
+        assert len(self._lines()) == 1
+        assert self._drops(caplog, "retire-failed") == [
+            "(button retire-failed) [channel: C1] [menu-ts: 99.1] "
+            "[block-id: menu-a] [action-ts: 100.2] [user: U_ALLOWED]"
+        ]
+        frontend._respond_ephemeral.assert_not_awaited()
+
+    async def test_an_incomplete_payload_is_a_retire_failure(self, frontend, caplog):
+        body = self._press()
+        del body["message"]["blocks"]
+        with caplog.at_level(logging.INFO):
+            await frontend._on_suggestion_action(body)
+        assert len(self._drops(caplog, "retire-failed")) == 1
+        frontend._on_message.assert_awaited_once()
+
+    async def test_no_drop_posts_a_thread_notice(self, frontend):
+        frontend._app.client.chat_update = AsyncMock(
+            side_effect=SlackApiError("nope", {"error": "message_not_found"})
+        )
+        frontend._app.client.chat_postMessage.reset_mock()
+        await frontend._on_suggestion_action(self._press())
+        await frontend._on_suggestion_action(self._press())
+        frontend._app.client.chat_postMessage.assert_not_awaited()
+
+    async def test_the_counted_press_keeps_its_button_log_line(self, frontend, caplog):
+        with caplog.at_level(logging.INFO, logger="claude_on_the_fly.slack"):
+            await frontend._on_suggestion_action(self._press())
+        assert (
+            'slack C1/t1: [from-id: U_ALLOWED] [display: "hoss"] [menu-ts: 99.1] '
+            "alpha? (button)"
+        ) in [r.getMessage() for r in caplog.records]
+
+
+class TestPressLedgerAtStart:
+    """The ledger exists from the first start of a press-recording bridge, and a
+    marker beside it names the process that is recording."""
+
+    @staticmethod
+    def _state():
+        return slack_mod.DATA_DIR / "state"
+
+    async def _start(self, frontend):
+        with patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls:
+            handler_cls.return_value.start_async = AsyncMock()
+            await frontend.start(AsyncMock())
+
+    async def test_start_creates_the_ledger_and_the_marker(self, frontend):
+        await self._start(frontend)
+        assert (self._state() / "slack.button-presses.jsonl").read_text() == ""
+        marker = json.loads(
+            (self._state() / "slack.button-presses.marker.json").read_text()
+        )
+        assert marker["pid"] == os.getpid()
+        assert marker["ledger"] == "slack.button-presses.jsonl"
+
+    async def test_start_keeps_the_presses_already_recorded(self, frontend):
+        self._state().mkdir(parents=True)
+        (self._state() / "slack.button-presses.jsonl").write_text('{"v": 1}\n')
+        await self._start(frontend)
+        assert (
+            self._state() / "slack.button-presses.jsonl"
+        ).read_text() == '{"v": 1}\n'
+
+    async def test_an_unwritable_state_dir_is_logged_and_start_goes_on(
+        self, frontend, caplog
+    ):
+        slack_mod.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self._state().write_text("not a directory")
+        with caplog.at_level(logging.ERROR):
+            await self._start(frontend)
+        assert "press ledger: cannot open" in caplog.text
+        frontend._handler.start_async.assert_awaited_once()
+
+    async def test_no_marker_when_the_ledger_cannot_be_made(self, frontend):
+        self._state().mkdir(parents=True)
+        (self._state() / "slack.button-presses.jsonl").mkdir()
+        await self._start(frontend)
+        assert not (self._state() / "slack.button-presses.marker.json").exists()
+
+
+class TestRespondEphemeral:
+    """A short line only the presser sees, through the interaction's response_url."""
+
+    _mock_aiohttp = staticmethod(TestDeleteEphemeral._mock_aiohttp)
+
+    async def test_posts_an_ephemeral_that_keeps_the_original(self, frontend):
+        mock_ctx, mock_session = self._mock_aiohttp()
+        with patch(
+            "claude_on_the_fly.slack.aiohttp.ClientSession", return_value=mock_ctx
+        ):
+            await frontend._respond_ephemeral(
+                "https://hooks.slack.test/actions/1", "a line"
+            )
+        assert mock_session.post.call_args.args[0] == (
+            "https://hooks.slack.test/actions/1"
+        )
+        assert mock_session.post.call_args.kwargs["json"] == {
+            "response_type": "ephemeral",
+            "replace_original": False,
+            "text": "a line",
+        }
+
+    async def test_an_error_status_is_logged(self, frontend, caplog):
+        mock_ctx, _ = self._mock_aiohttp(status=404, text="expired_url")
+        with (
+            patch(
+                "claude_on_the_fly.slack.aiohttp.ClientSession", return_value=mock_ctx
+            ),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.slack"),
+        ):
+            await frontend._respond_ephemeral("https://hooks.slack.test/a/1", "x")
+        assert "404" in caplog.text and "expired_url" in caplog.text
+
+    async def test_a_dead_response_url_is_logged_not_raised(self, frontend, caplog):
+        with (
+            patch(
+                "claude_on_the_fly.slack.aiohttp.ClientSession",
+                side_effect=RuntimeError("no route to host"),
+            ),
+            caplog.at_level("WARNING", logger="claude_on_the_fly.slack"),
+        ):
+            await frontend._respond_ephemeral("https://hooks.slack.test/a/1", "x")
+        assert "respond_ephemeral: could not reach response_url" in caplog.text
+
+    async def test_a_missing_response_url_is_logged(self, frontend, caplog):
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend._respond_ephemeral("", "x")
+        assert "respond_ephemeral: no response_url" in caplog.text
