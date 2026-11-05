@@ -255,6 +255,7 @@ class TestSlackMain:
             "blocked_senders",
             "allowed_bot_ids",
             "silent_sender_ids",
+            "owner_sender_ids",
         ):
             assert key not in built[0], key
 

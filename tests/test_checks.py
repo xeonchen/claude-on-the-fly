@@ -739,6 +739,7 @@ class TestEnvVarDeclarations:
         assert "SLACK_USER_TOKEN" in vars_
         assert "SLACK_ALLOWED_BOT_IDS" in vars_
         assert "SLACK_SILENT_SENDER_IDS" in vars_
+        assert "SLACK_OWNER_SENDER_IDS" in vars_
 
     def test_cron_has_no_env_vars(self):
         assert FRONTEND_ENV_VARS["cron"] == ()

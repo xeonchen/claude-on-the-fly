@@ -1360,6 +1360,10 @@ class AsyncTimeoutRetryHandler(AsyncConnectionErrorRetryHandler):
         )
 
 
+# The shape of a user or bot id, for telling a real entry from a malformed one.
+_SLACK_ID = re.compile(r"[UWB][A-Z0-9_]+")
+
+
 class SlackFrontend(Frontend):
     def __init__(
         self,
@@ -1370,6 +1374,7 @@ class SlackFrontend(Frontend):
         blocked_senders: set[str] | None = None,
         allowed_bot_ids: set[str] | None = None,
         silent_sender_ids: set[str] | None = None,
+        owner_sender_ids: set[str] | None = None,
         bot_policies: Mapping[str, object] | None = None,
         job_command: str | None = None,
         job_queue: JobQueue | None = None,
@@ -1404,6 +1409,7 @@ class SlackFrontend(Frontend):
         self._pinned_blocked_senders = blocked_senders
         self._pinned_allowed_bot_ids = allowed_bot_ids
         self._pinned_silent_sender_ids = silent_sender_ids
+        self._pinned_owner_sender_ids = owner_sender_ids
         self._pinned_bot_policies = bot_policies
         # bot_id -> (canonical config, parsed policy). Compiling an
         # operator's patterns on every event from a chatty bot is waste, and
@@ -1771,6 +1777,32 @@ class SlackFrontend(Frontend):
     def _silent_sender_ids(self) -> set[str]:
         return self._senders("SLACK_SILENT_SENDER_IDS", self._pinned_silent_sender_ids)
 
+    @property
+    def _owner_sender_ids(self) -> set[str]:
+        """The ids on the list that can be a Slack id at all.
+
+        `*`, `true`, a blank block entry and a nested list all flatten to a non-empty
+        string, and none of them can match a sender. Keeping them would make a list
+        admitting nobody look like a working one, in the startup log above all.
+        """
+        owners = self._senders("SLACK_OWNER_SENDER_IDS", self._pinned_owner_sender_ids)
+        return {owner for owner in owners if _SLACK_ID.fullmatch(owner)}
+
+    @property
+    def _owner_list_in_force(self) -> bool:
+        """Whether `slack.owner_senders` narrows the entrances at all.
+
+        Only a list that is truly absent leaves them open. A value that yields no
+        usable id (a mapping, a null left by commenting out its entries, blanks, an
+        empty environment variable) and a file that cannot be read both count as in
+        force with nobody on it: this gate must not open because its setting broke.
+        """
+        if self._pinned_owner_sender_ids is not None:
+            return bool(self._pinned_owner_sender_ids)
+        if "SLACK_OWNER_SENDER_IDS" in settings.environment():
+            return True
+        return settings.operator_has("slack", "owner_senders") is not False
+
     def _bot_policy(self, bot_id: str) -> _BotPolicy | None:
         """Return the bot's optional policy, re-reading operator config live."""
         policies: object
@@ -1906,6 +1938,7 @@ class SlackFrontend(Frontend):
             "blocked_senders": ",".join(sorted(self._blocked_senders)) or "<none>",
             "allowed_bots": ",".join(sorted(self._allowed_bot_ids)) or "<none>",
             "silent_senders": ",".join(sorted(self._silent_sender_ids)) or "<none>",
+            "owner_senders": self._describe_owner_senders(),
         }
 
     def _evict_stale_sessions(self) -> None:
@@ -2163,8 +2196,8 @@ class SlackFrontend(Frontend):
         was never granted, which a fallback channel would quietly allow.
 
         Landing in a shared channel is not a privilege leak: _on_approval_action
-        re-checks the clicker against the allowed senders, so bystanders can read
-        the prompt but cannot answer it.
+        re-checks the clicker with _is_owner, so bystanders can read the prompt but
+        cannot answer it.
         """
         if chat_id is None:
             return None
@@ -2334,9 +2367,10 @@ class SlackFrontend(Frontend):
         if not actions:
             return
         sender_id = (body.get("user") or {}).get("id", "")
-        # Only an allowed sender may widen policy. Anyone else who can see the
-        # message in the channel must not be able to grant the agent a host.
-        if not self._is_allowed(sender_id):
+        # Only an owner may widen policy. Anyone else who can see the message in
+        # the channel must not be able to grant the agent a host, and returning
+        # here leaves the prompt pending for an owner to answer.
+        if not self._is_owner(sender_id):
             logger.warning("slack: ignoring approval click from %s", sender_id)
             return
         action = actions[0]
@@ -2828,11 +2862,47 @@ class SlackFrontend(Frontend):
         """Single dispatch gate: only allowed senders reach the agent.
 
         Mirrors the message-path check in _ingest_event so every entry point
-        (messages, slash command, shortcut, picker) enforces the same policy.
+        enforces the same policy. The slash command, shortcut, picker and approval
+        clicks ask _is_owner, which is this same answer unless owner_senders is set.
         """
         if sender_id in self._blocked_senders:
             return False
         return self._allow_all_senders or sender_id in self._allowed_user_ids
+
+    def _is_owner(self, sender_id: str) -> bool:
+        """Gate for what can spend or widen on its own: the `$job` trigger, the
+        slash command, the shortcut and picker, and approval clicks.
+
+        With `slack.owner_senders` absent this is exactly `_is_allowed`. Otherwise
+        only the ids listed there count: not a `*` on the allowlist, and not the
+        token's own id, which `_allowed_user_ids` always adds. The blocklist still
+        wins, as it does over every other list. A list that is present but unusable
+        admits nobody, and says so on every refusal until it is fixed.
+        """
+        if not self._owner_list_in_force:
+            return self._is_allowed(sender_id)
+        owners = self._owner_sender_ids
+        if not owners:
+            logger.error(
+                "slack: refusing %s: slack.owner_senders is present but holds no "
+                "usable id, or the settings file cannot be read, so nobody is owner",
+                sender_id,
+            )
+        return sender_id in owners and sender_id not in self._blocked_senders
+
+    def _describe_owner_senders(self) -> str:
+        """The startup log's value for the list; a broken one is an ERROR there too."""
+        if not self._owner_list_in_force:
+            return "<none>"
+        owners = self._owner_sender_ids
+        if owners:
+            return ",".join(sorted(owners))
+        logger.error(
+            "slack: slack.owner_senders is present but holds no usable id, or the "
+            "settings file cannot be read: nobody can start jobs, run the slash "
+            "command or shortcut, or answer approval buttons until it is fixed"
+        )
+        return "<nobody: unusable>"
 
     async def _handle_slash_command(self, ack, command, body, respond) -> None:
         text = (command.get("text") or "").strip()
@@ -2841,8 +2911,8 @@ class SlackFrontend(Frontend):
         logger.info(
             "slack: slash command text=%s channel=%s", logs.redact(text), channel
         )
-        if not self._is_allowed(user_id):
-            logger.info("slack: slash command from %s denied (not allowed)", user_id)
+        if not self._is_owner(user_id):
+            logger.info("slack: slash command from %s denied (not owner)", user_id)
             await ack()
             await respond("Not authorized.")
             return
@@ -2866,10 +2936,8 @@ class SlackFrontend(Frontend):
         await ack()
         channel = (shortcut.get("channel") or {}).get("id", "")
         user_id = (shortcut.get("user") or {}).get("id", "")
-        if not self._is_allowed(user_id):
-            logger.info(
-                "slack: run-skill shortcut from %s denied (not allowed)", user_id
-            )
+        if not self._is_owner(user_id):
+            logger.info("slack: run-skill shortcut from %s denied (not owner)", user_id)
             return
         message = shortcut.get("message") or {}
         # A message shortcut carries the message it fired on; use its thread so
@@ -2948,8 +3016,8 @@ class SlackFrontend(Frontend):
         user_id, _, thread_ts = rest.partition(":")
         if not skill or not channel:
             return
-        if not self._is_allowed(user_id):
-            logger.info("slack: picker submit from %s denied (not allowed)", user_id)
+        if not self._is_owner(user_id):
+            logger.info("slack: picker submit from %s denied (not owner)", user_id)
             return
         prompt = f"/{skill} {args}".strip()
         thread_ts = await self._anchor_run(
@@ -3419,7 +3487,6 @@ class SlackFrontend(Frontend):
             and self._job_queue is not None
             and (job_text == job_command or job_text.startswith(job_command + " "))
         ):
-            task = job_text[len(job_command) :].strip()
             # Unlike $stop, $job is not idempotent — a catchup re-ingest on
             # reconnect would enqueue a second job. Mirror the normal path's
             # catch-up bookkeeping (which this branch returns before reaching):
@@ -3428,6 +3495,29 @@ class SlackFrontend(Frontend):
             # type so the recovered messages gate identically to the live path.
             self._processed_ts.add(ts)
             self._record_watermark(channel, ts, channel_type, thread_ts)
+            # Asked only when a list is set. With none this branch stays open to
+            # everyone who got here, which `_is_owner` alone would not do: it
+            # answers as `_is_allowed`, and that says no to a trusted bot, whose
+            # `B…` id lives on a list of its own.
+            if self._owner_list_in_force and not self._is_owner(sender_id):
+                logger.info(
+                    "slack %s/%s: refused %s from %s (not owner)",
+                    channel,
+                    thread_ts,
+                    job_command,
+                    sender_id,
+                )
+                # No notice to a bot. This branch charges no reply budget, so a
+                # bot that repeats the trigger when it sees a reply would go round
+                # with the notice unbounded. The log line above is the trace.
+                if not bot_id:
+                    await self._post_notice(
+                        channel,
+                        thread_ts,
+                        f"`{job_command}` is limited to the owner of this bridge.",
+                    )
+                return
+            task = job_text[len(job_command) :].strip()
             if not task:
                 # A bare trigger is somebody asking what is already running,
                 # which is the one moment the answer is worth more than the

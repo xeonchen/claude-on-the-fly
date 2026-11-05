@@ -9349,3 +9349,615 @@ class TestRespondEphemeral:
         with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
             await frontend._respond_ephemeral("", "x")
         assert "respond_ephemeral: no response_url" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# slack.owner_senders: four entrances narrowed, ordinary messages untouched
+# ---------------------------------------------------------------------------
+
+
+class TestOwnerSenders:
+    """`$job`, the slash command, the shortcut / picker and approval clicks are the
+    owner's when `slack.owner_senders` is set. Everything else keeps `_is_allowed`.
+
+    The list is pinned on the attribute rather than through the constructor, so a
+    build without the setting fails on the behaviour and not on an unknown keyword.
+    """
+
+    NOTICE = "`$job` is limited to the owner of this bridge."
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
+        monkeypatch.delenv("SLACK_OWNER_SENDER_IDS", raising=False)
+
+    def _frontend(
+        self,
+        owners=frozenset({"U_OWNER"}),
+        allowed=frozenset({"U_OWNER", "U_OTHER"}),
+        **kwargs,
+    ):
+        with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
+            client = MagicMock()
+            client.users_info = AsyncMock(return_value={"user": {"name": "someone"}})
+            client.conversations_info = AsyncMock(
+                return_value={
+                    "channel": {
+                        "name": "general",
+                        "is_mpim": False,
+                        "is_private": False,
+                    }
+                }
+            )
+            client.conversations_members = AsyncMock()
+            client.conversations_history = AsyncMock(return_value={"messages": []})
+            client.views_open = AsyncMock()
+            client.reactions_add = AsyncMock()
+            client.chat_postMessage = AsyncMock(
+                return_value={"ok": True, "ts": "111.222"}
+            )
+            mock_app_cls.return_value = MagicMock(client=client)
+            fe = SlackFrontend(
+                "xapp-tok",
+                "xoxp-tok",
+                "U_SELF",
+                allowed_user_ids=set(allowed),
+                job_command="$job",
+                job_queue=kwargs.pop("queue", None) or _FakeJobQueue(),
+                **kwargs,
+            )
+        fe._pinned_owner_sender_ids = set(owners)
+        fe._on_message = AsyncMock()
+        fe._resolve_sender = AsyncMock(return_value="someone")
+        fe._resolve_session_metadata = AsyncMock()
+        return fe
+
+    @staticmethod
+    def _dm(user: str, text: str, ts: str = "123.45") -> dict:
+        return {
+            "user": user,
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": ts,
+            "text": text,
+        }
+
+    @staticmethod
+    def _bot_post(bot_id: str, text: str, ts: str = "123.45") -> dict:
+        return {
+            "subtype": "bot_message",
+            "bot_id": bot_id,
+            "channel": "C1",
+            "channel_type": "channel",
+            "ts": ts,
+            "text": text,
+        }
+
+    @staticmethod
+    def _picker_view(user: str) -> dict:
+        return {
+            "private_metadata": f"D1:{user}:",
+            "state": {
+                "values": {
+                    "skill": {"cof_skill": {"selected_option": {"value": "simplify"}}},
+                    "args": {"cof_args": {"value": ""}},
+                }
+            },
+        }
+
+    @staticmethod
+    def _shortcut(user: str) -> dict:
+        return {
+            "trigger_id": "t",
+            "channel": {"id": "D1"},
+            "user": {"id": user},
+            "message": {"ts": "1.0"},
+        }
+
+    @staticmethod
+    def _click(user: str, action_id: str = "cotf-grant", nonce: str = "abc") -> dict:
+        return {
+            "user": {"id": user},
+            "actions": [{"action_id": action_id, "value": nonce}],
+        }
+
+    @staticmethod
+    def _posted_texts(fe) -> list[str]:
+        return [
+            call.kwargs["text"]
+            for call in fe._app.client.chat_postMessage.await_args_list
+        ]
+
+    # --- `_is_owner` itself ---
+
+    def test_a_set_list_is_the_only_thing_that_makes_an_owner(self):
+        fe = self._frontend()
+        assert fe._is_owner("U_OWNER") is True
+        assert fe._is_owner("U_OTHER") is False
+
+    def test_a_star_in_the_allowlist_makes_nobody_an_owner(self):
+        fe = self._frontend(allowed={"*"})
+        assert fe._is_allowed("U_RANDOM") is True
+        assert fe._is_owner("U_RANDOM") is False
+
+    def test_the_tokens_own_identity_is_not_an_owner_by_default(self):
+        fe = self._frontend()
+        assert fe._is_allowed("U_SELF") is True
+        assert fe._is_owner("U_SELF") is False
+
+    def test_a_star_in_the_owner_list_matches_nobody(self):
+        """It is a list of ids, so a `*` that is not honoured fails closed."""
+        fe = self._frontend(owners={"*"}, allowed={"*"})
+        assert fe._is_owner("U_RANDOM") is False
+
+    def test_an_owner_need_not_be_on_the_allowlist(self):
+        fe = self._frontend(allowed={"U_OTHER"})
+        assert fe._is_allowed("U_OWNER") is False
+        assert fe._is_owner("U_OWNER") is True
+
+    def test_the_blocklist_wins_over_the_owner_list(self):
+        fe = self._frontend(blocked_senders={"U_OWNER"})
+        assert fe._is_owner("U_OWNER") is False
+
+    @pytest.mark.parametrize("sender", ["U_OTHER", "U_SELF", "U_STRANGER", "B_BOT"])
+    def test_an_empty_list_answers_exactly_as_the_allowlist(self, sender):
+        fe = self._frontend(owners=set(), blocked_senders={"U_STRANGER"})
+        assert fe._is_owner(sender) is fe._is_allowed(sender)
+        fe._is_allowed = MagicMock(return_value="the allowlist's answer")
+        assert fe._is_owner(sender) == "the allowlist's answer"
+
+    # --- configuration ---
+
+    def test_the_list_reads_from_the_config_on_every_call(self, operator_settings):
+        fe = self._frontend()
+        fe._pinned_owner_sender_ids = None
+        operator_settings.write_text("slack:\n  owner_senders: [U1, U2]\n")
+        assert fe._owner_sender_ids == {"U1", "U2"}
+        operator_settings.write_text("slack:\n  owner_senders: [U3]\n")
+        assert fe._owner_sender_ids == {"U3"}
+
+    def test_the_environment_variable_is_comma_separated(
+        self, operator_settings, monkeypatch
+    ):
+        fe = self._frontend()
+        fe._pinned_owner_sender_ids = None
+        monkeypatch.setenv("SLACK_OWNER_SENDER_IDS", "U1,U2")
+        assert fe._owner_sender_ids == {"U1", "U2"}
+
+    def test_absent_config_means_no_list(self, operator_settings):
+        fe = self._frontend()
+        fe._pinned_owner_sender_ids = None
+        operator_settings.write_text("slack: {}\n")
+        assert fe._owner_sender_ids == set()
+
+    def test_the_constructor_pins_the_list(self):
+        with patch("claude_on_the_fly.slack.AsyncApp"):
+            pinned = SlackFrontend(
+                "xapp-tok", "xoxp-tok", "U_SELF", owner_sender_ids={"U_PINNED"}
+            )
+        assert pinned._owner_sender_ids == {"U_PINNED"}
+
+    def test_the_startup_log_shows_the_list(self):
+        assert self._frontend().describe()["owner_senders"] == "U_OWNER"
+        assert self._frontend(owners=set()).describe()["owner_senders"] == "<none>"
+
+    # --- entrance 4: `$job` ---
+
+    @pytest.mark.parametrize("text", ["$job summarize it", "$job"])
+    async def test_job_from_a_non_owner_is_refused_in_place(self, text):
+        queue = _FakeJobQueue()
+        fe = self._frontend(queue=queue)
+        await fe._ingest_event(self._dm("U_OTHER", text))
+        assert queue.jobs == []
+        fe._on_message.assert_not_awaited()
+        assert self._posted_texts(fe) == [self.NOTICE]
+        assert "123.45" in fe._processed_ts
+        # The refusal is on the catch-up record too, or a reconnect re-ingests it
+        # and the sender gets the notice twice.
+        assert fe._active_channels.get("D1") == "123.45"
+
+    async def test_job_from_a_non_owner_is_refused_when_tagged_in_a_channel(self):
+        queue = _FakeJobQueue()
+        fe = self._frontend(queue=queue)
+        event = {
+            "user": "U_OTHER",
+            "channel": "C1",
+            "channel_type": "channel",
+            "ts": "123.45",
+            "text": "<@U_SELF> $job go",
+        }
+        await fe._ingest_event(event)
+        assert queue.jobs == []
+        fe._on_message.assert_not_awaited()
+        assert self._posted_texts(fe) == [self.NOTICE]
+
+    async def test_job_from_the_owner_queues_when_tagged_in_a_channel(self):
+        queue = _FakeJobQueue()
+        fe = self._frontend(queue=queue)
+        event = {
+            "user": "U_OWNER",
+            "channel": "C1",
+            "channel_type": "channel",
+            "ts": "123.45",
+            "text": "<@U_SELF> $job go",
+        }
+        await fe._ingest_event(event)
+        assert [job.prompt for job in queue.jobs] == ["go"]
+
+    async def test_replaying_a_stored_job_is_still_refused(self):
+        """The replay button stays on the allowlist, but what it replays goes back
+        through the `$job` branch, so a held trigger cannot get past the gate."""
+        queue = _FakeJobQueue()
+        fe = self._frontend(queue=queue)
+        key = (_session_key("C1", "t1"), "U_OTHER")
+        fe._untagged_msgs[key] = [
+            {
+                "user": "U_OTHER",
+                "channel": "C1",
+                "channel_type": "channel",
+                "thread_ts": "t1",
+                "ts": "90.0",
+                "text": "$job go",
+            }
+        ]
+        fe._delete_ephemeral = AsyncMock()
+        await fe._on_replay_action(
+            {
+                "user": {"id": "U_OTHER"},
+                "actions": [{"value": "C1|t1"}],
+                "response_url": "",
+            }
+        )
+        assert queue.jobs == []
+        fe._on_message.assert_not_awaited()
+        assert self._posted_texts(fe) == [self.NOTICE]
+
+    @staticmethod
+    def _unpinned(fe, tmp_path, monkeypatch, text: str | None, env: str | None = None):
+        """Read the list through the real settings file, not the pinned attribute."""
+        fe._pinned_owner_sender_ids = None
+        path = tmp_path / "config.yaml"
+        if text is not None:
+            path.write_text(text)
+        monkeypatch.setattr(settings, "operator_settings", lambda: path)
+        if env is not None:
+            monkeypatch.setenv("SLACK_OWNER_SENDER_IDS", env)
+        return fe
+
+    @pytest.mark.parametrize(
+        ("text", "env"),
+        [
+            ("slack:\n  owner_senders: {U_OWNER: true}\n", None),
+            ("slack:\n  owner_senders:\n", None),
+            ("slack:\n  owner_senders: []\n", None),
+            ("slack:\n  owner_senders: ['', ' ']\n", None),
+            ("slack:\n  owner_senders: [*]\n", None),
+            ("slack:\n  owner_senders: ['*']\n", None),
+            ("slack:\n  owner_senders: '*'\n", None),
+            ("slack:\n  owner_senders: [ALL]\n", None),
+            ("slack:\n  owner_senders: [C012ABCDEF]\n", None),
+            ("slack:\n  owner_senders: true\n", None),
+            ("slack:\n  owner_senders: 12345\n", None),
+            ("slack:\n  owner_senders:\n    - \n", None),
+            ("slack:\n  owner_senders: [[U_OWNER]]\n", None),
+            ("slack:\n  owner_senders: 'U_OWNER U_OTHER'\n", None),
+            ("slack: not-a-mapping\n", None),
+            ("slack:\n  owner_senders: [U_OWNER]\n", ""),
+            ("slack:\n  owner_senders: [U_OWNER]\n", " , "),
+        ],
+    )
+    async def test_an_unusable_list_admits_nobody_and_says_so(
+        self, tmp_path, monkeypatch, caplog, text, env
+    ):
+        queue = _FakeJobQueue()
+        fe = self._unpinned(
+            self._frontend(queue=queue), tmp_path, monkeypatch, text, env
+        )
+        assert fe._owner_list_in_force is True
+        for sender in ("U_OTHER", "U_OWNER"):
+            assert fe._is_owner(sender) is False
+        await fe._ingest_event(self._dm("U_OTHER", "$job go"))
+        assert queue.jobs == []
+        assert self._posted_texts(fe) == [self.NOTICE]
+        assert fe._describe_owner_senders() == "<nobody: unusable>"
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert any("nobody is owner" in message for message in errors)
+        assert any("until it is fixed" in message for message in errors)
+
+    @pytest.mark.parametrize("kind", ["dangling", "directory"])
+    async def test_a_path_that_is_not_a_file_admits_nobody(
+        self, tmp_path, monkeypatch, kind
+    ):
+        fe = self._unpinned(self._frontend(), tmp_path, monkeypatch, None)
+        path = tmp_path / "config.yaml"
+        if kind == "dangling":
+            path.symlink_to(tmp_path / "gone.yaml")
+        else:
+            path.mkdir()
+        assert fe._owner_list_in_force is True
+        assert fe._is_owner("U_OTHER") is False
+
+    async def test_a_list_recovers_when_a_broken_file_is_fixed(
+        self, tmp_path, monkeypatch
+    ):
+        fe = self._unpinned(self._frontend(), tmp_path, monkeypatch, "slack: [\n")
+        assert fe._is_owner("U_OWNER") is False
+        (tmp_path / "config.yaml").write_text("slack:\n  owner_senders: [U_OWNER]\n")
+        assert fe._is_owner("U_OWNER") is True
+        assert fe._is_owner("U_OTHER") is False
+
+    async def test_a_malformed_entry_does_not_cost_the_real_one(
+        self, tmp_path, monkeypatch
+    ):
+        fe = self._unpinned(
+            self._frontend(),
+            tmp_path,
+            monkeypatch,
+            "slack:\n  owner_senders: [U_OWNER, null, '*']\n",
+        )
+        assert fe._is_owner("U_OWNER") is True
+        assert fe._is_owner("U_OTHER") is False
+        assert fe._describe_owner_senders() == "U_OWNER"
+
+    @pytest.mark.parametrize("text", [None, "", "slack:\n  stats: summary\n"])
+    async def test_an_absent_list_leaves_the_entrances_as_they_were(
+        self, tmp_path, monkeypatch, text
+    ):
+        queue = _FakeJobQueue()
+        fe = self._unpinned(self._frontend(queue=queue), tmp_path, monkeypatch, text)
+        assert fe._owner_list_in_force is False
+        assert fe._is_owner("U_OTHER") is True
+        assert fe._describe_owner_senders() == "<none>"
+        await fe._ingest_event(self._dm("U_OTHER", "$job go"))
+        assert [job.prompt for job in queue.jobs] == ["go"]
+
+    async def test_a_usable_list_read_from_the_file_narrows(
+        self, tmp_path, monkeypatch
+    ):
+        fe = self._unpinned(
+            self._frontend(),
+            tmp_path,
+            monkeypatch,
+            "slack:\n  owner_senders: [U_OWNER]\n",
+        )
+        assert fe._is_owner("U_OWNER") is True
+        assert fe._is_owner("U_OTHER") is False
+        assert fe._describe_owner_senders() == "U_OWNER"
+
+    async def test_a_refused_job_is_not_refused_twice(self):
+        fe = self._frontend()
+        event = self._dm("U_OTHER", "$job summarize it")
+        await fe._ingest_event(event)
+        await fe._ingest_event(dict(event))
+        assert self._posted_texts(fe) == [self.NOTICE]
+
+    async def test_the_notice_names_the_configured_trigger(self):
+        fe = self._frontend()
+        fe._job_command = "!bg"
+        await fe._ingest_event(self._dm("U_OTHER", "!bg go"))
+        assert self._posted_texts(fe) == [
+            "`!bg` is limited to the owner of this bridge."
+        ]
+
+    async def test_only_the_owner_queues_a_job(self):
+        queue = _FakeJobQueue()
+        fe = self._frontend(queue=queue)
+        await fe._ingest_event(self._dm("U_OTHER", "$job one", ts="1.0"))
+        await fe._ingest_event(self._dm("U_OWNER", "$job two", ts="2.0"))
+        assert [job.prompt for job in queue.jobs] == ["two"]
+        assert queue.jobs[0].origin["sender_id"] == "U_OWNER"
+
+    async def test_only_the_owner_gets_the_bare_job_listing(self):
+        fe = self._frontend()
+        fe._read_unfinished_jobs = MagicMock(return_value=[])
+        await fe._ingest_event(self._dm("U_OTHER", "$job", ts="1.0"))
+        fe._read_unfinished_jobs.assert_not_called()
+        await fe._ingest_event(self._dm("U_OWNER", "$job", ts="2.0"))
+        fe._read_unfinished_jobs.assert_called_once()
+
+    async def test_a_trusted_bot_outside_the_list_is_refused_without_a_notice(self):
+        """A notice is a post into the bot's own thread, and this refusal charges no
+        reply budget, so a bot that answers what it sees would loop with it unbounded.
+        """
+        queue = _FakeJobQueue()
+        fe = self._frontend(queue=queue, allowed_bot_ids={"B_TRUSTED"})
+        await fe._ingest_event(self._bot_post("B_TRUSTED", "$job go"))
+        assert queue.jobs == []
+        fe._on_message.assert_not_awaited()
+        fe._app.client.chat_postMessage.assert_not_awaited()
+        assert "123.45" in fe._processed_ts
+
+    async def test_a_bot_with_a_user_field_is_refused_without_a_notice(self):
+        """An app's own bot user takes the person path but is still a bot."""
+        queue = _FakeJobQueue()
+        fe = self._frontend(queue=queue)
+        event = self._dm("U_OTHER", "$job go")
+        event["bot_id"] = "B_APP"
+        await fe._ingest_event(event)
+        assert queue.jobs == []
+        fe._app.client.chat_postMessage.assert_not_awaited()
+        assert "123.45" in fe._processed_ts
+
+    async def test_a_listed_bot_queues_a_job(self):
+        queue = _FakeJobQueue()
+        fe = self._frontend(
+            owners={"B_TRUSTED"}, queue=queue, allowed_bot_ids={"B_TRUSTED"}
+        )
+        await fe._ingest_event(self._bot_post("B_TRUSTED", "$job go"))
+        assert [job.prompt for job in queue.jobs] == ["go"]
+
+    # --- entrances 2 and 3: slash, shortcut, picker ---
+
+    async def test_only_the_owner_runs_the_slash_command(self):
+        fe = self._frontend()
+        ack, respond = AsyncMock(), AsyncMock()
+        command = {"text": "simplify", "channel_id": "D1", "user_id": "U_OTHER"}
+        await fe._handle_slash_command(ack, command, {"trigger_id": "t"}, respond)
+        ack.assert_awaited()
+        respond.assert_awaited_once_with("Not authorized.")
+        fe._on_message.assert_not_awaited()
+        fe._app.client.chat_postMessage.assert_not_awaited()
+
+        command["user_id"] = "U_OWNER"
+        await fe._handle_slash_command(ack, command, {"trigger_id": "t"}, respond)
+        assert fe._on_message.await_args.args[1] == "/simplify"
+        respond.assert_awaited_once()  # still only the first refusal
+
+    async def test_a_bare_slash_command_opens_no_picker_for_a_non_owner(self):
+        fe = self._frontend()
+        ack, respond = AsyncMock(), AsyncMock()
+        command = {"text": "", "channel_id": "D1", "user_id": "U_OTHER"}
+        await fe._handle_slash_command(ack, command, {"trigger_id": "t"}, respond)
+        respond.assert_awaited_once_with("Not authorized.")
+        fe._app.client.views_open.assert_not_awaited()
+
+    async def test_only_the_owner_opens_the_picker_from_the_shortcut(self):
+        fe = self._frontend()
+        ack = AsyncMock()
+        with (
+            patch("claude_on_the_fly.slack.cached_skills", AsyncMock(return_value=[])),
+            patch("claude_on_the_fly.slack.get_backend", MagicMock()),
+        ):
+            await fe._handle_run_skill_shortcut(ack, self._shortcut("U_OTHER"))
+            ack.assert_awaited()
+            fe._app.client.views_open.assert_not_awaited()
+            await fe._handle_run_skill_shortcut(ack, self._shortcut("U_OWNER"))
+        fe._app.client.views_open.assert_awaited_once()
+        fe._on_message.assert_not_awaited()
+
+    async def test_only_the_owner_submits_the_picker(self):
+        fe = self._frontend()
+        ack = AsyncMock()
+        await fe._handle_picker_submit(ack, self._picker_view("U_OTHER"))
+        ack.assert_awaited()
+        fe._on_message.assert_not_awaited()
+        fe._app.client.chat_postMessage.assert_not_awaited()
+
+        await fe._handle_picker_submit(ack, self._picker_view("U_OWNER"))
+        assert fe._on_message.await_args.args[1] == "/simplify"
+
+    # --- entrance 1: approval buttons ---
+
+    @pytest.mark.parametrize(
+        ("action_id", "granted"), [("cotf-grant", True), ("cotf-deny", False)]
+    )
+    async def test_a_non_owner_click_leaves_the_prompt_for_the_owner(
+        self, action_id, granted, caplog
+    ):
+        fe = self._frontend()
+        future = asyncio.get_running_loop().create_future()
+        fe._pending_approvals["abc"] = future
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await fe._on_approval_action(self._click("U_OTHER", action_id))
+        assert not future.done(), "a non-owner decided the prompt"
+        assert fe._pending_approvals["abc"] is future
+        assert "ignoring approval click from U_OTHER" in caplog.text
+
+        await fe._on_approval_action(self._click("U_OWNER", action_id))
+        assert future.result() is granted
+
+    # --- what stays on `_is_allowed` ---
+
+    async def test_an_ordinary_message_from_a_non_owner_still_triggers(self):
+        fe = self._frontend()
+        await fe._ingest_event(self._dm("U_OTHER", "hello there"))
+        fe._on_message.assert_awaited_once()
+        assert fe._on_message.await_args.args[1].endswith("hello there")
+        assert self.NOTICE not in self._posted_texts(fe)
+
+    async def test_a_silent_non_owner_is_still_suppressed(self):
+        fe = self._frontend(silent_sender_ids={"U_OTHER"})
+        await fe._ingest_event(self._dm("U_OTHER", "fyi"))
+        fe._on_message.assert_awaited_once()
+        assert fe._pending_reply_suppressed[_session_key("D1", "123.45")] == deque(
+            [True]
+        )
+
+    async def test_a_suggestion_tap_from_a_non_owner_still_works(self, frontend):
+        frontend._pinned_owner_sender_ids = {"U_OWNER"}
+        frontend._sessions[_session_key("C1", "t1")] = ("C1", "t1")
+        frontend._app.client.chat_update = AsyncMock()
+        await frontend._on_suggestion_action(TestSuggestionActions._tap())
+        frontend._on_message.assert_awaited_once()
+
+    async def test_the_continue_and_replay_buttons_stay_on_the_allowlist(
+        self, frontend
+    ):
+        """Neither button is an entrance the list narrows: a non-owner's click is
+        told apart from a stranger's only by the allowlist. The backlogs here hold
+        no `$job`; a replayed one is refused by its own test."""
+        frontend._pinned_owner_sender_ids = {"U_OWNER"}
+        frontend._is_owner = MagicMock(
+            side_effect=AssertionError("the click itself never consults the owner list")
+        )
+        value = "C1|t1"
+        frontend._reply_counts[_session_key("C1", "t1")] = 7
+        body = {
+            "user": {"id": "U_ALLOWED"},
+            "actions": [{"value": value}],
+            "response_url": "",
+        }
+        frontend._delete_ephemeral = AsyncMock()
+        await frontend._on_continue_action(body)
+        assert frontend._reply_counts[_session_key("C1", "t1")] == 0
+        await frontend._on_replay_action(body)
+
+    # --- compatibility: no list, today's behaviour ---
+
+    async def test_no_list_leaves_job_open_to_an_allowed_sender(self):
+        queue = _FakeJobQueue()
+        fe = self._frontend(owners=set(), queue=queue)
+        await fe._ingest_event(self._dm("U_OTHER", "$job go"))
+        assert [job.prompt for job in queue.jobs] == ["go"]
+        assert self.NOTICE not in self._posted_texts(fe)
+
+    async def test_no_list_leaves_job_open_to_a_trusted_bot(self):
+        """`_is_allowed` answers no for a `B…` id, since bots live on a list of their
+        own, so the `$job` site must not take that answer as a refusal."""
+        queue = _FakeJobQueue()
+        fe = self._frontend(owners=set(), queue=queue, allowed_bot_ids={"B_TRUSTED"})
+        assert fe._is_allowed("B_TRUSTED") is False
+        await fe._ingest_event(self._bot_post("B_TRUSTED", "$job go"))
+        assert [job.prompt for job in queue.jobs] == ["go"]
+
+    async def test_no_list_leaves_the_slash_command_open(self):
+        fe = self._frontend(owners=set())
+        ack, respond = AsyncMock(), AsyncMock()
+        command = {"text": "simplify", "channel_id": "D1", "user_id": "U_OTHER"}
+        await fe._handle_slash_command(ack, command, {"trigger_id": "t"}, respond)
+        respond.assert_not_awaited()
+        fe._on_message.assert_awaited_once()
+
+    async def test_no_list_leaves_the_shortcut_and_picker_open(self):
+        fe = self._frontend(owners=set())
+        ack = AsyncMock()
+        with (
+            patch("claude_on_the_fly.slack.cached_skills", AsyncMock(return_value=[])),
+            patch("claude_on_the_fly.slack.get_backend", MagicMock()),
+        ):
+            await fe._handle_run_skill_shortcut(ack, self._shortcut("U_OTHER"))
+        fe._app.client.views_open.assert_awaited_once()
+        await fe._handle_picker_submit(ack, self._picker_view("U_OTHER"))
+        fe._on_message.assert_awaited_once()
+
+    async def test_no_list_leaves_approval_open(self):
+        fe = self._frontend(owners=set())
+        future = asyncio.get_running_loop().create_future()
+        fe._pending_approvals["abc"] = future
+        await fe._on_approval_action(self._click("U_OTHER"))
+        assert future.result() is True
+
+    async def test_no_list_still_refuses_a_stranger_at_each_entrance(self):
+        fe = self._frontend(owners=set())
+        ack, respond = AsyncMock(), AsyncMock()
+        command = {"text": "simplify", "channel_id": "D1", "user_id": "U_STRANGER"}
+        await fe._handle_slash_command(ack, command, {"trigger_id": "t"}, respond)
+        respond.assert_awaited_once_with("Not authorized.")
+        await fe._handle_run_skill_shortcut(ack, self._shortcut("U_STRANGER"))
+        fe._app.client.views_open.assert_not_awaited()
+        await fe._handle_picker_submit(ack, self._picker_view("U_STRANGER"))
+        fe._on_message.assert_not_awaited()
+        future = asyncio.get_running_loop().create_future()
+        fe._pending_approvals["abc"] = future
+        await fe._on_approval_action(self._click("U_STRANGER"))
+        assert not future.done()

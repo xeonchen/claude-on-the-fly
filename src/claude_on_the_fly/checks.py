@@ -101,6 +101,7 @@ SLACK_ENV_VARS: tuple[str, ...] = (
     "SLACK_ALLOWED_SENDER_IDS",
     "SLACK_BLOCKED_SENDER_IDS",
     "SLACK_SILENT_SENDER_IDS",
+    "SLACK_OWNER_SENDER_IDS",
     "SLACK_SLASH_COMMAND",
     # Declared here and not in JOBS_ENV_VARS: the slack daemon is the process
     # that binds it (slack.JOB_COMMAND), so it is the one env_editor must
