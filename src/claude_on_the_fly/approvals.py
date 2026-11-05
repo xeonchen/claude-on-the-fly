@@ -439,7 +439,8 @@ def gate_from_frontend(frontend: object, chat_id: int | None = None) -> Approval
     Note the split this preserves: *where* the prompt appears is a routing
     question, but *who may answer* stays an authorization question the frontend
     enforces separately. Posting into a shared channel is therefore safe; every
-    frontend re-checks the clicker against its allowed senders.
+    frontend re-checks the clicker against who may answer there (Slack: owner_senders
+    when set, otherwise its allowed senders).
     """
     asker = getattr(frontend, "ask_approval", None)
     if asker is None:

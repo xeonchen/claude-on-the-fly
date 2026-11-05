@@ -155,6 +155,7 @@ FIELDS: dict[str, Field] = {
     "slack.allowed_senders": Field("SLACK_ALLOWED_SENDER_IDS", sep=","),
     "slack.blocked_senders": Field("SLACK_BLOCKED_SENDER_IDS", sep=","),
     "slack.silent_senders": Field("SLACK_SILENT_SENDER_IDS", sep=","),
+    "slack.owner_senders": Field("SLACK_OWNER_SENDER_IDS", sep=","),
     "slack.stats": Field("SLACK_STATS_MODE"),
     "slack.slash_command": Field("SLACK_SLASH_COMMAND"),
     "slack.job_command": Field("SLACK_JOB_COMMAND"),
@@ -359,6 +360,31 @@ def operator(name: str) -> dict[str, Any]:
             exc,
         )
         return {}
+
+
+def operator_has(name: str, key: str) -> bool | None:
+    """Whether the operator's file carries `name.key`, whatever its value.
+
+    None means it cannot be told: the file or the section is unusable, so a key the
+    operator did write may be in there. For a setting whose absence means "off" and
+    whose presence narrows a permission, that is a different answer from False.
+    So is a path holding something that is not a file: a dangling symlink, say, is
+    an operator's file gone missing, and only nothing at all at that name is absent.
+    """
+    path = operator_settings()
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        section = _section(_cached_document(path), name)
+    except (ValueError, OSError):
+        return None
+    return key in section
 
 
 def _from_environment(name: str, env: Mapping[str, str] | None) -> str | None:

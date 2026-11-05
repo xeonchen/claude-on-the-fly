@@ -114,6 +114,7 @@ next one without a restart.
 - In channels, only allowed senders (auto-allowed ID + `slack.allowed_senders`) can trigger Claude via @mention
 - Bot posts (HubSpot, Jira, etc.) are ignored unless their bot ID (`B…`) is in `slack.allowed_senders`; trusted bot posts trigger Claude without an @mention. Don't list this app's own bot ID (it would loop)
 - Senders listed in `slack.silent_senders` still trigger Claude, but their reply is not posted back — useful for alert/automation bots you want handled quietly
+- Senders listed in `slack.owner_senders` are the only ones who can use the job trigger, the slash command, the run-skill shortcut and picker, and approval buttons. Leave it unset and those stay open to every allowed sender. Everyone else in `slack.allowed_senders` still triggers Claude with ordinary messages. An approval prompt posts in the thread that asked, so an owner has to be able to see that thread to answer it
 - A `slack.bot_policies` entry can narrow an allowed bot before agent dispatch. Under `selective`, a message reaches the agent only if it mentions the agent or matches one of your `process_if` patterns; everything else is dropped without consuming an agent turn
 - Claude responds in a thread — as you with a user token, or as the app with a bot token
 - Each thread = one Claude session. All threads of a DM, group DM or channel share one working directory and one conversation memory (`memory/notes.md` in that directory), on top of the per-person memory
