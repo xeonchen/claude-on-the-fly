@@ -9961,3 +9961,205 @@ class TestOwnerSenders:
         fe._pending_approvals["abc"] = future
         await fe._on_approval_action(self._click("U_STRANGER"))
         assert not future.done()
+
+
+# ---------------------------------------------------------------------------
+# Shared rooms: a reply naming internals is held where someone else can read
+# ---------------------------------------------------------------------------
+
+
+class TestSharedRoomSend:
+    """The adapter around `shared_room.check`: membership, the owners' DM, and
+    what is actually posted. The matching rules are test_shared_room.py's."""
+
+    HOLD = "Karina has 2026-11-06-7659 on the Desk."
+
+    @pytest.fixture(autouse=True)
+    def _rules(self, frontend, monkeypatch):
+        monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Karina,Desk")
+        monkeypatch.setenv(
+            "SLACK_SHARED_ROOM_HOLD_PATTERNS", r"\b20\d\d-\d\d-\d\d-[0-9a-f]{4}\b"
+        )
+        monkeypatch.delenv("SLACK_SHARED_ROOM_PEOPLE", raising=False)
+        frontend._pinned_owner_sender_ids = {"U_OWN"}
+        client = frontend._app.client
+        client.chat_postMessage.return_value = {"ok": True, "ts": "9.9"}
+        client.conversations_open = AsyncMock(return_value={"channel": {"id": "D_OWN"}})
+        client.conversations_members.return_value = {
+            "members": ["U_SELF", "U_OWN", "U_COLLEAGUE"]
+        }
+        frontend._remember_session(7, "G1", "1.0")
+
+    def _posts(self, frontend) -> list[dict]:
+        return [c.kwargs for c in frontend._app.client.chat_postMessage.call_args_list]
+
+    async def test_a_matching_reply_is_held_and_sent_to_the_owner(self, frontend):
+        response = Response(body=self.HOLD, suggestions=["Ask Karina"])
+        assert await frontend.send(7, response) == []
+        room, dm = self._posts(frontend)
+        assert room == {
+            "channel": "G1",
+            "text": "收到，處理中，有結果會再回覆。",
+            "thread_ts": "1.0",
+        }
+        assert dm["channel"] == "D_OWN"
+        assert "G1" in dm["text"]
+        assert "Karina" in dm["text"]
+        assert self.HOLD in dm["text"]
+        # The agent's suggestion labels are its text too: none ride along.
+        assert "Ask Karina" not in json.dumps(dm["blocks"])
+
+    async def test_held_attachments_go_to_the_owner(self, frontend, tmp_path):
+        path = tmp_path / "a.txt"
+        path.write_text("x")
+        with patch.object(frontend, "_upload_attachments", AsyncMock()) as upload:
+            got = await frontend.send(7, Response(body=self.HOLD, attachments=[path]))
+        assert got == [path]
+        upload.assert_awaited_once_with("D_OWN", None, [path])
+
+    async def test_a_room_with_only_the_owner_is_untouched(self, frontend):
+        frontend._app.client.conversations_members.return_value = {
+            "members": ["U_SELF", "U_OWN"]
+        }
+        await frontend.send(7, Response(body=self.HOLD))
+        (post,) = self._posts(frontend)
+        assert post["channel"] == "G1"
+        assert self.HOLD in post["text"]
+
+    async def test_ordinary_text_in_a_shared_room_posts(self, frontend):
+        await frontend.send(7, Response(body="Thanks, the help desk has it."))
+        (post,) = self._posts(frontend)
+        assert "help desk" in post["text"]
+
+    async def test_nothing_configured_reads_no_membership(self, frontend, monkeypatch):
+        monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_NAMES")
+        monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_PATTERNS")
+        await frontend.send(7, Response(body=self.HOLD))
+        frontend._app.client.conversations_members.assert_not_awaited()
+        (post,) = self._posts(frontend)
+        assert self.HOLD in post["text"]
+
+    async def test_unreadable_membership_fails_closed_and_is_not_cached(self, frontend):
+        frontend._app.client.conversations_members.side_effect = Exception("boom")
+        await frontend.send(7, Response(body=self.HOLD))
+        assert self._posts(frontend)[0]["text"] == "收到，處理中，有結果會再回覆。"
+        assert "G1" not in frontend._room_members_cache
+
+    async def test_membership_is_cached_briefly(self, frontend):
+        await frontend.send(7, Response(body="hello"))
+        await frontend.send(7, Response(body="again"))
+        assert frontend._app.client.conversations_members.await_count == 1
+
+    async def test_membership_pages_are_followed(self, frontend):
+        frontend._app.client.conversations_members.side_effect = [
+            {"members": ["U_SELF", "U_OWN"], "response_metadata": {"next_cursor": "c"}},
+            {"members": ["U_COLLEAGUE"], "response_metadata": {"next_cursor": ""}},
+        ]
+        assert await frontend._room_members("G1") == {"U_SELF", "U_OWN", "U_COLLEAGUE"}
+
+    async def test_no_owner_list_holds_with_nowhere_to_send(self, frontend, caplog):
+        frontend._pinned_owner_sender_ids = None
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            assert await frontend.send(7, Response(body=self.HOLD)) == []
+        (post,) = self._posts(frontend)
+        assert post["text"] == "收到，處理中，有結果會再回覆。"
+        assert "no owner DM" in caplog.text
+
+    @pytest.mark.parametrize(
+        "room_post",
+        [Exception("boom"), {"ok": False, "error": "not_in_channel"}],
+    )
+    async def test_a_failed_held_line_still_reaches_the_owner(
+        self, frontend, caplog, room_post
+    ):
+        dm_ok = {"ok": True, "ts": "9.9"}
+        frontend._app.client.chat_postMessage.side_effect = [room_post, dm_ok]
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            await frontend.send(7, Response(body=self.HOLD))
+        assert self._posts(frontend)[1]["channel"] == "D_OWN"
+        assert "held line not" in caplog.text
+
+    async def test_a_failed_owner_dm_returns_nothing(self, frontend):
+        frontend._app.client.chat_postMessage.side_effect = [
+            {"ok": True, "ts": "9.9"},
+            {"ok": False, "error": "boom"},
+        ]
+        assert await frontend.send(7, Response(body=self.HOLD)) == []
+
+    async def test_rules_come_from_the_config_file(
+        self, frontend, monkeypatch, operator_settings
+    ):
+        monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_NAMES")
+        monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_PATTERNS")
+        operator_settings.write_text(
+            "slack:\n"
+            "  shared_room_hold_names: [Karina, Winter]\n"
+            "  shared_room_hold_patterns:\n"
+            "    - '\\b20\\d\\d-\\d\\d-\\d\\d-[0-9a-f]{4}\\b'\n"
+            "    - 'x{1,2} y'\n"
+            "  shared_room_people: [Winter]\n"
+        )
+        rules = frontend._hold_rules()
+        assert rules.names == ("Karina",)
+        assert [p.pattern for p in rules.patterns] == [
+            r"\b20\d\d-\d\d-\d\d-[0-9a-f]{4}\b",
+            "x{1,2} y",
+        ]
+
+    def test_a_broken_pattern_is_logged_once(self, frontend, monkeypatch, caplog):
+        monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_PATTERNS", "[unclosed")
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+            frontend._hold_rules()
+            frontend._hold_rules()
+        assert caplog.text.count("[unclosed") == 1
+
+
+class TestSharedRoomPrompt:
+    """The prompt line appears only where someone besides an owner can read."""
+
+    @pytest.fixture(autouse=True)
+    def _rules(self, frontend, monkeypatch):
+        monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Karina,Desk")
+        monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_PATTERNS", raising=False)
+        frontend._pinned_owner_sender_ids = {"U_OWN"}
+        frontend._app.client.conversations_info.return_value = {
+            "channel": {"name": "mpdm-a-b", "is_mpim": True}
+        }
+
+    async def _facts(self, frontend, members, channel_type="mpim") -> dict:
+        frontend._app.client.conversations_members.return_value = {"members": members}
+        frontend._remember_session(8, "G1", "1.0")
+        await frontend._resolve_session_metadata(
+            8, "hoss", "U_OWN", "G1", channel_type, "1.0"
+        )
+        return frontend.session_facts(8)
+
+    async def test_a_room_with_a_colleague_gets_the_line(self, frontend):
+        facts = await self._facts(frontend, ["U_SELF", "U_OWN", "U_COLLEAGUE"])
+        assert "Karina" in facts["audience"]
+        assert "audience:" in build_system_prompt_for(facts)
+
+    async def test_a_room_with_only_the_owner_gets_none(self, frontend):
+        facts = await self._facts(frontend, ["U_SELF", "U_OWN"])
+        assert "audience" not in facts
+        assert "audience:" not in build_system_prompt_for(facts)
+
+    async def test_a_colleagues_dm_with_the_bot_gets_the_line(self, frontend):
+        facts = await self._facts(frontend, ["U_SELF", "U_COLLEAGUE"], "im")
+        assert "audience" in facts
+
+    async def test_nothing_configured_adds_nothing(self, frontend, monkeypatch):
+        monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_NAMES")
+        facts = await self._facts(frontend, ["U_SELF", "U_OWN", "U_COLLEAGUE"])
+        assert "audience" not in facts
+
+    async def test_forgetting_the_session_drops_it(self, frontend):
+        await self._facts(frontend, ["U_SELF", "U_OWN", "U_COLLEAGUE"])
+        frontend._forget_session(8)
+        assert 8 not in frontend._shared_sessions
+
+
+def build_system_prompt_for(facts: dict) -> str:
+    from claude_on_the_fly.agent import build_system_prompt
+
+    return build_system_prompt("slack", "hoss", "dm", None, None, facts)

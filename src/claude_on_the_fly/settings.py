@@ -156,6 +156,12 @@ FIELDS: dict[str, Field] = {
     "slack.blocked_senders": Field("SLACK_BLOCKED_SENDER_IDS", sep=","),
     "slack.silent_senders": Field("SLACK_SILENT_SENDER_IDS", sep=","),
     "slack.owner_senders": Field("SLACK_OWNER_SENDER_IDS", sep=","),
+    "slack.shared_room_hold_names": Field("SLACK_SHARED_ROOM_HOLD_NAMES", sep=","),
+    # Newline-joined: a regex can hold a comma (`{4}`) and a space.
+    "slack.shared_room_hold_patterns": Field(
+        "SLACK_SHARED_ROOM_HOLD_PATTERNS", sep="\n"
+    ),
+    "slack.shared_room_people": Field("SLACK_SHARED_ROOM_PEOPLE", sep=","),
     "slack.stats": Field("SLACK_STATS_MODE"),
     "slack.slash_command": Field("SLACK_SLASH_COMMAND"),
     "slack.job_command": Field("SLACK_JOB_COMMAND"),

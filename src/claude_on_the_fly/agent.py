@@ -657,6 +657,8 @@ def where_you_are(
         ("your memory", f"{MEMORY_ROOT}/users/{sender_id}/"),
         ("uploads", f"{INBOX_DIRNAME}/ in the workspace"),
         ("deliveries", str(outbox_dir) if outbox_dir else ""),
+        # Set by a frontend for a room someone besides the owner can read.
+        ("audience", facts.get("audience", "")),
     ]
     width = max(len(label) for label, _value in rows) + 1
     lines = [f"  {label + ':':<{width}} {value}" for label, value in rows if value]
