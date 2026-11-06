@@ -13,7 +13,7 @@ import re
 import time
 from collections import OrderedDict, deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -3893,9 +3893,27 @@ class SlackFrontend(Frontend):
                 thread_ts,
             )
             return response.attachments
-        reason = await self._shared_room_reason(channel, response.body)
-        if reason is not None:
-            return await self._hold_reply(chat_id, channel, thread_ts, response, reason)
+        checking = await self._shared_room(channel)
+        if checking is not None:
+            rules, room = checking
+            reason = shared_room.check(response.body, rules, room)
+            if reason is not None:
+                return await self._hold_reply(
+                    chat_id, channel, thread_ts, response, reason
+                )
+            # A button label is the agent's text too. One that matches takes the
+            # whole menu off the post; the reply itself still goes out.
+            for label in response.suggestions:
+                label_reason = shared_room.check(label, rules, room)
+                if label_reason is not None:
+                    logger.warning(
+                        "slack %s/%s => suggestions dropped in a shared room: %s",
+                        channel,
+                        thread_ts,
+                        label_reason,
+                    )
+                    response = replace(response, suggestions=[])
+                    break
         logger.info("slack %s/%s => %s", channel, thread_ts, logs.redact(response.body))
 
         messages = _reply_messages(response.body, response)
@@ -4864,8 +4882,11 @@ class SlackFrontend(Frontend):
         channels = [await self._open_dm_channel(owner) for owner in self._owner_ids()]
         return frozenset(c for c in channels if c)
 
-    async def _shared_room_reason(self, channel: str, body: str) -> str | None:
-        """Why `body` may not be posted into `channel`, or None to post it.
+    async def _shared_room(
+        self, channel: str
+    ) -> tuple[shared_room.HoldRules, shared_room.RoomFacts] | None:
+        """The rules and facts for checking a reply into `channel`, or None when
+        nothing needs checking (no rules, or only an owner can read it).
 
         Membership is read here rather than taken from the session: a colleague
         added after the thread began is a reader of this reply."""
@@ -4878,7 +4899,7 @@ class SlackFrontend(Frontend):
         room = shared_room.RoomFacts(
             shared=True, owner_dm_channels=await self._owner_dm_channels()
         )
-        return shared_room.check(body, rules, room)
+        return rules, room
 
     async def _hold_reply(
         self,
