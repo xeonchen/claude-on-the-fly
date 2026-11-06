@@ -3,6 +3,7 @@ splits long bodies, marks failures, and reports post errors to its caller."""
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -200,3 +201,122 @@ async def test_fallback_text_summarises_the_first_line() -> None:
     )
 
     assert client.chat_postMessage.call_args.kwargs["text"] == "Deploy finished"
+
+
+# ---------------------------------------------------------------------------
+# Shared rooms: a job result is the session's own text landing in the room, so
+# it gets the same check as a chat reply.
+# ---------------------------------------------------------------------------
+
+HELD = "收到，處理中，有結果會再回覆。"
+HOLD_TEXT = "Opened 2026-11-06-c7d3 for Karina."
+
+
+class _Rooms:
+    """A stand-in for SlackRooms: the room is shared or it is not."""
+
+    def __init__(self, shared: bool, dms: frozenset[str] = frozenset({"D_OWN"})):
+        from claude_on_the_fly.shared_room import RoomFacts
+
+        self._facts = RoomFacts(shared=True, owner_dm_channels=dms) if shared else None
+        self.asked: list[str] = []
+
+    async def facts(self, channel: str):
+        self.asked.append(channel)
+        return self._facts
+
+
+@pytest.fixture
+def hold_rules(monkeypatch):
+    monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Karina")
+    monkeypatch.setenv(
+        "SLACK_SHARED_ROOM_HOLD_PATTERNS",
+        r"(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])",
+    )
+    monkeypatch.delenv("SLACK_SHARED_ROOM_PEOPLE", raising=False)
+
+
+def _posts(client) -> list[dict]:
+    return [c.kwargs for c in client.chat_postMessage.await_args_list]
+
+
+async def test_a_matching_result_in_a_shared_room_is_held(hold_rules) -> None:
+    client = _client()
+    notifier = SlackThreadNotifier(client, rooms=_Rooms(shared=True))
+    await notifier.notify(
+        {"channel": "G1", "thread_ts": "5.0"}, Result(ok=True, text=HOLD_TEXT)
+    )
+    room, dm = _posts(client)
+    assert room == {"channel": "G1", "thread_ts": "5.0", "text": HELD}
+    assert dm["channel"] == "D_OWN"
+    assert "thread_ts" not in dm or dm["thread_ts"] is None
+    assert "G1" in json.dumps(dm["blocks"], ensure_ascii=False)
+    assert HOLD_TEXT in json.dumps(dm["blocks"], ensure_ascii=False)
+
+
+async def test_a_failed_job_text_is_checked_too(hold_rules) -> None:
+    client = _client()
+    notifier = SlackThreadNotifier(client, rooms=_Rooms(shared=True))
+    await notifier.notify({"channel": "G1"}, Result(ok=False, text="Karina crashed"))
+    assert _posts(client)[0]["text"] == HELD
+
+
+async def test_a_clean_result_in_a_shared_room_posts(hold_rules) -> None:
+    client = _client()
+    notifier = SlackThreadNotifier(client, rooms=_Rooms(shared=True))
+    await notifier.notify({"channel": "G1"}, Result(ok=True, text="All done."))
+    (post,) = _posts(client)
+    assert post["text"] == "All done."
+
+
+async def test_an_owner_only_room_is_untouched(hold_rules) -> None:
+    client = _client()
+    notifier = SlackThreadNotifier(client, rooms=_Rooms(shared=False))
+    await notifier.notify({"channel": "D_OWN"}, Result(ok=True, text=HOLD_TEXT))
+    (post,) = _posts(client)
+    assert post["text"] == HOLD_TEXT
+
+
+async def test_no_rules_reads_no_room(monkeypatch) -> None:
+    monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_NAMES", raising=False)
+    monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_PATTERNS", raising=False)
+    rooms = _Rooms(shared=True)
+    client = _client()
+    await SlackThreadNotifier(client, rooms=rooms).notify(
+        {"channel": "G1"}, Result(ok=True, text=HOLD_TEXT)
+    )
+    assert rooms.asked == []
+    assert _posts(client)[0]["text"] == HOLD_TEXT
+
+
+async def test_a_held_result_with_no_owner_dm_is_logged(hold_rules, caplog) -> None:
+    client = _client()
+    notifier = SlackThreadNotifier(client, rooms=_Rooms(shared=True, dms=frozenset()))
+    with caplog.at_level("ERROR"):
+        await notifier.notify({"channel": "G1"}, Result(ok=True, text=HOLD_TEXT))
+    (post,) = _posts(client)
+    assert post["text"] == HELD
+    assert "no owner DM" in caplog.text
+
+
+async def test_a_failed_held_line_raises_for_a_retry(hold_rules) -> None:
+    client = _client()
+    client.chat_postMessage.side_effect = RuntimeError("down")
+    notifier = SlackThreadNotifier(client, rooms=_Rooms(shared=True))
+    with pytest.raises(RuntimeError):
+        await notifier.notify({"channel": "G1"}, Result(ok=True, text=HOLD_TEXT))
+
+
+async def test_the_worker_wires_the_check_with_live_owners(monkeypatch) -> None:
+    """`jobs.cli` builds the notifier with a room reader over the same client,
+    taking owners from settings at each call."""
+    from claude_on_the_fly.jobs import cli
+    from claude_on_the_fly.shared_room_slack import SlackRooms
+
+    client = _client()
+    notifier = cli._slack_notifier(client)
+    rooms = notifier._rooms
+    assert isinstance(rooms, SlackRooms)
+    assert rooms._client is client
+    monkeypatch.setenv("SLACK_OWNER_SENDER_IDS", "U_OWN")
+    assert rooms._owners() == {"U_OWN"}

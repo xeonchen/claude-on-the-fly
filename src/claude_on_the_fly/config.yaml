@@ -633,7 +633,9 @@ slack:
   # Unset, nothing is held and no line is added. Needs owner_senders to know whose
   # rooms are private; without it every room with a human in it counts as shared.
   # shared_room_hold_names: [Anyujin, Desk]
-  # shared_room_hold_patterns: ['\b20\d\d-\d\d-\d\d-[0-9a-f]{4}\b']
+  # A pattern gets no word edges for free: write them as lookarounds, since `\b`
+  # sees no edge between CJK text and an id glued to it.
+  # shared_room_hold_patterns: ['(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])']
   # shared_room_people: []
 
   # Optional per-bot gate, evaluated before a session or agent process is created.

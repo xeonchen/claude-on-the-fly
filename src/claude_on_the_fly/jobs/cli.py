@@ -23,7 +23,7 @@ import signal
 import sys
 import time
 from collections.abc import Mapping
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 from claude_on_the_fly import agent, checks, envfile, sandbox, settings, tmux
@@ -158,6 +158,19 @@ def _notifier_loop_warning(
     return None
 
 
+def _slack_notifier(client: Any) -> SlackThreadNotifier:
+    """The Slack notifier with the shared-room check over the same client. Who
+    the owners are is read live from settings, as the chat frontend does."""
+    from claude_on_the_fly.shared_room_slack import (
+        SlackRooms,
+        owner_ids_from_settings,
+    )
+
+    return SlackThreadNotifier(
+        client, rooms=SlackRooms(client, owners=owner_ids_from_settings)
+    )
+
+
 def build_components(
     token: str, env: Mapping[str, str], brokers: JobBrokers | None = None
 ) -> tuple[JobQueue, AgentRunner, Notifier, OutcomeRecorder, AlertSink | None]:
@@ -184,7 +197,7 @@ def build_components(
     # the job came from: a Slack thread, or the cron entry's own log file.
     notifier = RoutingNotifier(
         {
-            "slack": SlackThreadNotifier(AsyncWebClient(token=token)),
+            "slack": _slack_notifier(AsyncWebClient(token=token)),
             "cron": LogNotifier(append_log),
         }
     )
