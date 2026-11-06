@@ -387,6 +387,9 @@ not an unbounded workspace history replay. None of these bounds is a setting.
 | `blocked_senders` | list / empty | Deny list; wins over allowed | Immediate |
 | `silent_senders` | list / empty | Trigger without posting a reply | Immediate |
 | `owner_senders` | list / empty | Only these IDs may use `job_command`, `slash_command`, the run-skill shortcut and picker, and approval buttons; empty leaves them to allowed senders. Not derived from `allowed_senders`; `*` matches nobody; `blocked_senders` wins | Immediate |
+| `shared_room_hold_names` | list / empty | Names (case-sensitive, whole word) a reply may not carry into a room someone besides an owner can read; such a reply is replaced there by a fixed line and sent to the owners' DM with the reason. Also adds one line to those rooms' system prompts. Empty holds nothing | Immediate |
+| `shared_room_hold_patterns` | list of regex / empty | Same, for id shapes (for example a ticket id). A pattern that does not compile logs an ERROR and is skipped | Immediate |
+| `shared_room_people` | list / empty | Names of real people that also appear in `shared_room_hold_names`; listing one takes it off the hold list | Immediate |
 | `bot_policies` | mapping / empty | Per-allowed-bot pre-agent gate; see below | Immediate |
 | `stats` | string / `summary` | `off`, `summary`, `detailed`; invalid uses summary | Immediate |
 | `slash_command` | string / unset | Bot-token Slack command | Restart required |

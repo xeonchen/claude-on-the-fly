@@ -29,7 +29,14 @@ from slack_sdk.http_retry.builtin_async_handlers import (
 )
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
-from claude_on_the_fly import button_presses, checks, logs, settings, suggestion_deny
+from claude_on_the_fly import (
+    button_presses,
+    checks,
+    logs,
+    settings,
+    shared_room,
+    suggestion_deny,
+)
 from claude_on_the_fly.agent import (
     DATA_DIR,
     MAX_ATTACHMENT_BYTES,
@@ -811,6 +818,12 @@ def _suggestion_blocks(labels: list[str]) -> list[dict]:
     ]
 
 
+def _setting_list(name: str, sep: str) -> list[str]:
+    """A list-valued setting, split on the separator its `Field` joins with."""
+    raw = settings.get(name, "")
+    return [item for item in raw.split(sep) if item.strip()]
+
+
 def _reply_messages(body: str, response: Response) -> list[tuple[str, list[dict]]]:
     """Render a Response as the messages Slack will take, in order.
 
@@ -1483,6 +1496,15 @@ class SlackFrontend(Frontend):
         # Cache definitive answers briefly, and never cache an answer produced by
         # an API failure.
         self._own_dm_ttl = 60.0
+        # channel -> (member ids, expiry) for the shared-room check. Same rule as
+        # `_own_dm`: a definitive answer is cached briefly, a failure never.
+        self._room_members_cache: dict[str, tuple[frozenset[str], float]] = {}
+        # session -> whether someone besides an owner can read its room, resolved
+        # with the session's metadata. Read by `session_facts` for the prompt line.
+        self._shared_sessions: dict[int, bool] = {}
+        # Hold-pattern errors already logged, so a broken pattern is one ERROR
+        # per distinct message rather than one per reply.
+        self._logged_hold_errors: set[str] = set()
         self._connected_once = False
         self._workspace_names: dict[int, str] = {}
         # session -> the per-thread directory name this session had before
@@ -1893,6 +1915,10 @@ class SlackFrontend(Frontend):
         sender_name = self._sender_names.get(chat_id)
         if sender_name:
             facts["sender_name"] = sender_name
+        if self._shared_sessions.get(chat_id):
+            line = shared_room.prompt_line(self._hold_rules())
+            if line:
+                facts["audience"] = line
         return facts
 
     def sender_identity(self, chat_id: int) -> str:
@@ -2079,6 +2105,7 @@ class SlackFrontend(Frontend):
         self._sender_names.pop(session_id, None)
         self._channel_contexts.pop(session_id, None)
         self._channel_names.pop(session_id, None)
+        self._shared_sessions.pop(session_id, None)
         self._session_sender_ids.pop(session_id, None)
         self._reply_counts.pop(session_id, None)
         self._cancel_gate_notice(session_id)
@@ -3866,6 +3893,9 @@ class SlackFrontend(Frontend):
                 thread_ts,
             )
             return response.attachments
+        reason = await self._shared_room_reason(channel, response.body)
+        if reason is not None:
+            return await self._hold_reply(chat_id, channel, thread_ts, response, reason)
         logger.info("slack %s/%s => %s", channel, thread_ts, logs.redact(response.body))
 
         messages = _reply_messages(response.body, response)
@@ -4748,6 +4778,22 @@ class SlackFrontend(Frontend):
             f"Here it is via DM instead.)_\n\n"
         )
         body = prefix + response.body
+        if not await self._post_to_dm(
+            dm_channel, body, response, "fallback_dm", sender_id
+        ):
+            return []
+        await self._upload_attachments(dm_channel, None, response.attachments)
+        logger.info(
+            "fallback_dm: delivered response to %s for session %s", sender_id, chat_id
+        )
+        return response.attachments
+
+    async def _post_to_dm(
+        self, dm_channel: str, body: str, response: Response, tag: str, who: str
+    ) -> bool:
+        """Post `body` into a DM as a reply would be posted. False if any part
+        failed, which leaves the rest unsent. `tag` and `who` name the caller and
+        the recipient in the log line."""
         for text, blocks in _reply_messages(body, response):
             try:
                 resp = await self._app.client.chat_postMessage(
@@ -4758,17 +4804,130 @@ class SlackFrontend(Frontend):
                     unfurl_media=False,
                 )
             except Exception as exc:
-                logger.error("fallback_dm: DM to %s failed: %s", sender_id, exc)
-                return []
+                logger.error("%s: DM to %s failed: %s", tag, who, exc)
+                return False
             if not resp.get("ok"):
-                logger.error("fallback_dm: DM post failed for %s: %s", sender_id, resp)
-                return []
+                logger.error("%s: DM post failed for %s: %s", tag, who, resp)
+                return False
             self._remember_sent_timestamp(resp["ts"])
-        await self._upload_attachments(dm_channel, None, response.attachments)
-        logger.info(
-            "fallback_dm: delivered response to %s for session %s", sender_id, chat_id
+        return True
+
+    # --- Shared rooms: what a reply may say where others can read it ---
+
+    def _hold_rules(self) -> shared_room.HoldRules:
+        """The configured hold rules, re-read live like every other sender list."""
+        rules, errors = shared_room.HoldRules.build(
+            _setting_list("SLACK_SHARED_ROOM_HOLD_NAMES", ","),
+            _setting_list("SLACK_SHARED_ROOM_HOLD_PATTERNS", "\n"),
+            _setting_list("SLACK_SHARED_ROOM_PEOPLE", ","),
         )
-        return response.attachments
+        for error in errors:
+            if error not in self._logged_hold_errors:
+                self._logged_hold_errors.add(error)
+                logger.error(
+                    "slack: slack.shared_room_hold_patterns: skipping %s", error
+                )
+        return rules
+
+    def _owner_ids(self) -> frozenset[str]:
+        """The owners whose rooms are private to them. Empty without an owner
+        list, which makes every room with a human in it shared."""
+        if not self._owner_list_in_force:
+            return frozenset()
+        return frozenset(self._owner_sender_ids)
+
+    async def _room_members(self, channel: str) -> frozenset[str] | None:
+        """Every member id of `channel`, or None if Slack would not say."""
+        cached = self._room_members_cache.get(channel)
+        now = time.monotonic()
+        if cached is not None and cached[1] > now:
+            return cached[0]
+        members: set[str] = set()
+        cursor = ""
+        try:
+            while True:
+                resp = await self._app.client.conversations_members(
+                    channel=channel, cursor=cursor or None, limit=200
+                )
+                members.update(resp.get("members", []))
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor", "")
+                if not cursor:
+                    break
+        except Exception as exc:
+            logger.warning("shared_room: members of %s unreadable: %s", channel, exc)
+            return None
+        result = frozenset(members)
+        self._room_members_cache[channel] = (result, now + self._own_dm_ttl)
+        return result
+
+    async def _owner_dm_channels(self) -> frozenset[str]:
+        channels = [await self._open_dm_channel(owner) for owner in self._owner_ids()]
+        return frozenset(c for c in channels if c)
+
+    async def _shared_room_reason(self, channel: str, body: str) -> str | None:
+        """Why `body` may not be posted into `channel`, or None to post it.
+
+        Membership is read here rather than taken from the session: a colleague
+        added after the thread began is a reader of this reply."""
+        rules = self._hold_rules()
+        if not rules.enabled:
+            return None
+        members = await self._room_members(channel)
+        if not shared_room.is_shared(members, self._owner_ids(), self._user_id):
+            return None
+        room = shared_room.RoomFacts(
+            shared=True, owner_dm_channels=await self._owner_dm_channels()
+        )
+        return shared_room.check(body, rules, room)
+
+    async def _hold_reply(
+        self,
+        chat_id: int,
+        channel: str,
+        thread_ts: str | None,
+        response: Response,
+        reason: str,
+    ) -> list[Path]:
+        """Post the fixed line in the room; send the reply to the owners' DM.
+
+        The room gets the line as plain text: no footer and no suggestion
+        buttons, since a button label is the agent's text too. Returns the
+        attachments handed to an owner, so the outbox archives only what landed.
+        """
+        logger.warning(
+            "slack %s/%s => held from a shared room: %s", channel, thread_ts, reason
+        )
+        try:
+            resp = await self._app.client.chat_postMessage(
+                channel=channel, text=shared_room.HELD_REPLY, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.error("shared_room: held line not posted in %s: %s", channel, exc)
+        else:
+            if resp.get("ok"):
+                self._remember_sent_timestamp(resp["ts"])
+            else:
+                logger.error("shared_room: held line not ok in %s: %s", channel, resp)
+        label = self.session_facts(chat_id).get("conversation", channel)
+        notice = shared_room.held_notice(label, reason, response.body)
+        held = Response(body=notice, attachments=response.attachments)
+        dm_channels = sorted(await self._owner_dm_channels())
+        if not dm_channels:
+            logger.error(
+                "shared_room: reply held from %s has no owner DM to go to "
+                "(slack.owner_senders unset or unusable); it stays in the session "
+                "transcript only",
+                channel,
+            )
+            return []
+        delivered = False
+        for dm_channel in dm_channels:
+            if await self._post_to_dm(
+                dm_channel, notice, held, "shared_room", dm_channel
+            ):
+                await self._upload_attachments(dm_channel, None, held.attachments)
+                delivered = True
+        return response.attachments if delivered else []
 
     def _workspace_path(self, session_id: int) -> Path:
         return workspace_path(self.workspace_name(session_id), DATA_DIR)
@@ -4970,6 +5129,11 @@ class SlackFrontend(Frontend):
         """
         if session_id in self._workspace_names:
             return
+
+        if self._hold_rules().enabled:
+            self._shared_sessions[session_id] = shared_room.is_shared(
+                await self._room_members(channel), self._owner_ids(), self._user_id
+            )
 
         # The whole thread_ts, fraction included, with the dot swapped for a
         # dash so it reads as one path segment. Truncating to the integer

@@ -623,6 +623,18 @@ slack:
   # here, and being on allowed_senders or being the token's own id does not count.
   # Only a missing key means unset: present but unusable, nobody passes, with an ERROR.
   # owner_senders: [U012ABCDEF]
+  # What a reply may not say where someone besides an owner can read it (a channel, a
+  # group DM, a colleague's DM with the bot). A reply naming one of these, matching one
+  # of the patterns, or linking into an owner's DM is not posted there: the room gets
+  # one fixed line and the owners' DM gets the reply with the room and the rule that
+  # matched. Such rooms' sessions are also told the same in their system prompt.
+  # Names match case-sensitively as whole words. A colleague who shares a name with
+  # one of them goes in shared_room_people, which takes that name off the list.
+  # Unset, nothing is held and no line is added. Needs owner_senders to know whose
+  # rooms are private; without it every room with a human in it counts as shared.
+  # shared_room_hold_names: [Anyujin, Desk]
+  # shared_room_hold_patterns: ['\b20\d\d-\d\d-\d\d-[0-9a-f]{4}\b']
+  # shared_room_people: []
 
   # Optional per-bot gate, evaluated before a session or agent process is created.
   # Bot ids here must still appear in allowed_senders. Invalid policies log an
