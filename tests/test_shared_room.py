@@ -16,7 +16,7 @@ from claude_on_the_fly.shared_room import (
     prompt_line,
 )
 
-SEATS = ("Anyujin", "Karina", "IU", "Wonyoung", "Winter", "Desk")
+SEATS = ("Atlas", "Borealis", "QZ", "Cirrus", "Spring", "Desk")
 DESK_ID = r"(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])"
 OWNER_DM = "D0OWNER1"
 
@@ -40,25 +40,25 @@ class TestMatches:
         assert reason is not None
         assert seat in reason
 
-    @pytest.mark.parametrize("seat", ["Karina", "IU", "Desk"])
+    @pytest.mark.parametrize("seat", ["Borealis", "QZ", "Desk"])
     def test_a_seat_inside_chinese_text_holds(self, seat):
         """CJK characters are word characters to `\\b`, so a plain `\\b` boundary
-        would miss 「交給Karina處理」 entirely."""
+        would miss 「交給Borealis處理」 entirely."""
         assert check(f"這件事我交給{seat}處理。", rules(), SHARED) is not None
 
     def test_desk_as_the_systems_name_holds(self):
         assert check("I opened a ticket on the Desk for it.", rules(), SHARED)
 
     def test_a_full_desk_id_holds_and_names_it(self):
-        reason = check("Tracked as 2026-11-06-7659.", rules(), SHARED)
+        reason = check("Tracked as 2030-01-02-ab12.", rules(), SHARED)
         assert reason is not None
-        assert "2026-11-06-7659" in reason
+        assert "2030-01-02-ab12" in reason
 
     def test_a_desk_id_glued_to_chinese_text_holds(self):
-        assert check("已開工單2026-11-06-c7d3處理", rules(), SHARED) is not None
+        assert check("已開工單2030-01-02-cd34處理", rules(), SHARED) is not None
 
     def test_a_desk_id_inside_a_longer_token_does_not(self):
-        assert check("build-2026-11-06-c7d3x", rules(), SHARED) is None
+        assert check("build-2030-01-02-cd34x", rules(), SHARED) is None
 
     def test_an_owner_dm_client_url_holds(self):
         text = f"https://app.slack.com/client/T0ABC/{OWNER_DM}"
@@ -92,12 +92,12 @@ class TestFalseMatches:
         [
             "Please raise it with the help desk.",
             "It's on my desk, I'll look tomorrow.",
-            "Thanks @Kyle, @Andy and <@U0123ABC> for the review.",
-            "This is ACE-16707, due 2026-11-06.",
+            "Thanks @Sam, @Lee and <@U0123ABC> for the review.",
+            "This is ABC-12345, due 2026-11-06.",
             "Release window is 2026-11-06 to 2026-11-13.",
-            "Shipping before winter is the plan.",
-            "Karinas and IUs are not names here.",  # suffixes do not match
-            "AIU-12 and SKIU are other strings.",
+            "Shipping before spring is the plan.",
+            "Borealises and QZs are not names here.",  # suffixes do not match
+            "AQZ-12 and SKQZ are other strings.",
             "See https://acme.slack.com/archives/C0PUBLIC/p1730880000123456",
             "Desktop app crashed again.",
         ],
@@ -106,10 +106,10 @@ class TestFalseMatches:
         assert check(text, rules(), SHARED) is None
 
     def test_a_person_named_like_a_seat_posts_when_listed_as_a_person(self):
-        assert check("Winter will join the call.", rules(), SHARED) is not None
-        assert check("Winter will join the call.", rules(("Winter",)), SHARED) is None
+        assert check("Spring will join the call.", rules(), SHARED) is not None
+        assert check("Spring will join the call.", rules(("Spring",)), SHARED) is None
         # The other seats still hold.
-        assert check("Karina will join.", rules(("Winter",)), SHARED) is not None
+        assert check("Borealis will join.", rules(("Spring",)), SHARED) is not None
 
     def test_another_owners_dm_link_is_not_this_rule(self):
         text = "see https://acme.slack.com/archives/D0SOMEONE/p1"
@@ -118,13 +118,13 @@ class TestFalseMatches:
 
 class TestRooms:
     def test_a_room_with_only_the_owner_is_untouched(self):
-        text = "Karina has 2026-11-06-7659 on the Desk."
+        text = "Borealis has 2030-01-02-ab12 on the Desk."
         assert check(text, rules(), PRIVATE) is None
 
     def test_no_rules_configured_holds_nothing(self):
         empty, _ = HoldRules.build((), (), ())
         assert not empty.enabled
-        assert check("Karina 2026-11-06-7659", empty, SHARED) is None
+        assert check("Borealis 2030-01-02-ab12", empty, SHARED) is None
 
     @pytest.mark.parametrize(
         ("members", "owners", "own", "shared"),
@@ -145,15 +145,15 @@ class TestRooms:
 
 class TestBuild:
     def test_a_broken_pattern_is_reported_and_the_rest_still_apply(self):
-        built, errors = HoldRules.build(("Karina",), ("[unclosed", DESK_ID), ())
+        built, errors = HoldRules.build(("Borealis",), ("[unclosed", DESK_ID), ())
         assert len(errors) == 1
         assert "[unclosed" in errors[0]
-        assert check("2026-11-06-7659", built, SHARED) is not None
+        assert check("2030-01-02-ab12", built, SHARED) is not None
 
     def test_blank_entries_are_dropped(self):
-        built, errors = HoldRules.build(("", " Karina "), ("", " "), (" ",))
+        built, errors = HoldRules.build(("", " Borealis "), ("", " "), (" ",))
         assert errors == ()
-        assert built.names == ("Karina",)
+        assert built.names == ("Borealis",)
         assert built.patterns == ()
 
 
@@ -162,10 +162,10 @@ class TestWording:
         assert HELD_REPLY == "收到，處理中，有結果會再回覆。"
 
     def test_held_notice_names_room_and_rule_then_carries_the_original(self):
-        notice = held_notice("group-dm G1", "name `Karina`", "original text")
+        notice = held_notice("group-dm G1", "name `Borealis`", "original text")
         first, rest = notice.split("\n", 1)
         assert "G1" in first
-        assert "Karina" in first
+        assert "Borealis" in first
         assert rest.strip() == "original text"
 
     def test_prompt_line_lists_the_names_and_the_asks(self):

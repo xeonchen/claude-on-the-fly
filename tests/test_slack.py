@@ -9972,11 +9972,11 @@ class TestSharedRoomSend:
     """The adapter around `shared_room.check`: membership, the owners' DM, and
     what is actually posted. The matching rules are test_shared_room.py's."""
 
-    HOLD = "Karina has 2026-11-06-7659 on the Desk."
+    HOLD = "Borealis has 2030-01-02-ab12 on the Desk."
 
     @pytest.fixture(autouse=True)
     def _rules(self, frontend, monkeypatch):
-        monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Karina,Desk")
+        monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Borealis,Desk")
         monkeypatch.setenv(
             "SLACK_SHARED_ROOM_HOLD_PATTERNS",
             r"(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])",
@@ -9996,7 +9996,7 @@ class TestSharedRoomSend:
         return [c.kwargs for c in frontend._app.client.chat_postMessage.call_args_list]
 
     async def test_a_matching_reply_is_held_and_sent_to_the_owner(self, frontend):
-        response = Response(body=self.HOLD, suggestions=["Ask Karina"])
+        response = Response(body=self.HOLD, suggestions=["Ask Borealis"])
         assert await frontend.send(7, response) == []
         room, dm = self._posts(frontend)
         assert room == {
@@ -10006,16 +10006,16 @@ class TestSharedRoomSend:
         }
         assert dm["channel"] == "D_OWN"
         assert "G1" in dm["text"]
-        assert "Karina" in dm["text"]
+        assert "Borealis" in dm["text"]
         assert self.HOLD in dm["text"]
         # The agent's suggestion labels are its text too: none ride along.
-        assert "Ask Karina" not in json.dumps(dm["blocks"])
+        assert "Ask Borealis" not in json.dumps(dm["blocks"])
 
     async def test_a_desk_id_glued_to_chinese_is_held(self, frontend):
-        await frontend.send(7, Response(body="已開工單2026-11-06-c7d3處理"))
+        await frontend.send(7, Response(body="已開工單2030-01-02-cd34處理"))
         room, dm = self._posts(frontend)
         assert room["text"] == "收到，處理中，有結果會再回覆。"
-        assert "2026-11-06-c7d3" in dm["text"]
+        assert "2030-01-02-cd34" in dm["text"]
 
     async def test_held_attachments_go_to_the_owner(self, frontend, tmp_path):
         path = tmp_path / "a.txt"
@@ -10027,7 +10027,7 @@ class TestSharedRoomSend:
 
     async def test_a_matching_suggestion_label_drops_the_menu(self, frontend, caplog):
         response = Response(
-            body="Done, see above.", suggestions=["Ask Karina", "Retry"]
+            body="Done, see above.", suggestions=["Ask Borealis", "Retry"]
         )
         with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
             await frontend.send(7, response)
@@ -10035,11 +10035,11 @@ class TestSharedRoomSend:
         assert post["channel"] == "G1"
         assert "Done, see above." in post["text"]
         dumped = json.dumps(post["blocks"])
-        assert "Ask Karina" not in dumped
+        assert "Ask Borealis" not in dumped
         assert "Retry" not in dumped
         assert "suggestions dropped" in caplog.text
         # The reply kept its own suggestions object untouched.
-        assert response.suggestions == ["Ask Karina", "Retry"]
+        assert response.suggestions == ["Ask Borealis", "Retry"]
 
     async def test_clean_suggestion_labels_stay(self, frontend):
         await frontend.send(7, Response(body="Done.", suggestions=["Retry"]))
@@ -10050,9 +10050,9 @@ class TestSharedRoomSend:
         frontend._app.client.conversations_members.return_value = {
             "members": ["U_SELF", "U_OWN"]
         }
-        await frontend.send(7, Response(body="Done.", suggestions=["Ask Karina"]))
+        await frontend.send(7, Response(body="Done.", suggestions=["Ask Borealis"]))
         (post,) = self._posts(frontend)
-        assert "Ask Karina" in json.dumps(post["blocks"])
+        assert "Ask Borealis" in json.dumps(post["blocks"])
 
     async def test_a_room_with_only_the_owner_is_untouched(self, frontend):
         frontend._app.client.conversations_members.return_value = {
@@ -10153,14 +10153,14 @@ class TestSharedRoomSend:
         monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_PATTERNS")
         operator_settings.write_text(
             "slack:\n"
-            "  shared_room_hold_names: [Karina, Winter]\n"
+            "  shared_room_hold_names: [Borealis, Spring]\n"
             "  shared_room_hold_patterns:\n"
             "    - '(?<![A-Za-z0-9_])20\\d\\d-\\d\\d-\\d\\d-[0-9a-f]{4}(?![A-Za-z0-9_])'\n"
             "    - 'x{1,2} y'\n"
-            "  shared_room_people: [Winter]\n"
+            "  shared_room_people: [Spring]\n"
         )
         rules = frontend._hold_rules()
-        assert rules.names == ("Karina",)
+        assert rules.names == ("Borealis",)
         assert [p.pattern for p in rules.patterns] == [
             r"(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])",
             "x{1,2} y",
@@ -10182,7 +10182,7 @@ class TestSharedRoomPrompt:
 
     @pytest.fixture(autouse=True)
     def _rules(self, frontend, monkeypatch):
-        monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Karina,Desk")
+        monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Borealis,Desk")
         monkeypatch.delenv("SLACK_SHARED_ROOM_HOLD_PATTERNS", raising=False)
         frontend._pinned_owner_sender_ids = {"U_OWN"}
         frontend._app.client.conversations_info.return_value = {
@@ -10199,7 +10199,7 @@ class TestSharedRoomPrompt:
 
     async def test_a_room_with_a_colleague_gets_the_line(self, frontend):
         facts = await self._facts(frontend, ["U_SELF", "U_OWN", "U_COLLEAGUE"])
-        assert "Karina" in facts["audience"]
+        assert "Borealis" in facts["audience"]
         assert "audience:" in build_system_prompt_for(facts)
 
     async def test_a_room_with_only_the_owner_gets_none(self, frontend):
