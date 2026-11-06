@@ -18,11 +18,15 @@ The worker decides what to do about it.
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
+from claude_on_the_fly import shared_room
 from claude_on_the_fly.jobs.core import Result
 from claude_on_the_fly.jobs.failure_text import public_failure_text
 from claude_on_the_fly.slack_mrkdwn import split_blocks
+
+if TYPE_CHECKING:
+    from claude_on_the_fly.shared_room_slack import SlackRooms
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +70,17 @@ def _fallback_text(body: str) -> str:
 
 
 class SlackThreadNotifier:
-    """`Notifier` that posts into `origin`'s channel/thread via a Slack client."""
+    """`Notifier` that posts into `origin`'s channel/thread via a Slack client.
 
-    def __init__(self, client: _PostsMessages) -> None:
+    With `rooms`, a result bound for a room someone besides an owner can read
+    gets the same check as a chat reply: one that names what the operator listed
+    in `slack.shared_room_*` leaves the fixed line in the room and goes to each
+    owner's DM with the room and the rule that matched.
+    """
+
+    def __init__(self, client: _PostsMessages, rooms: SlackRooms | None = None) -> None:
         self._client = client
+        self._rooms = rooms
 
     async def notify(self, origin: dict[str, Any], result: Result) -> None:
         channel = origin.get("channel")
@@ -82,6 +93,43 @@ class SlackThreadNotifier:
             if result.ok
             else f":warning: Job failed\n{public_failure_text(result.text)}"
         )
+        if self._rooms is not None:
+            from claude_on_the_fly.shared_room_slack import hold_rules_from_settings
+
+            rules = hold_rules_from_settings()
+            room = await self._rooms.facts(channel) if rules.enabled else None
+            reason = shared_room.check(body, rules, room) if room else None
+            if room and reason:
+                await self._hold(channel, thread_ts, body, reason, room)
+                return
+        await self._post(channel, thread_ts, body)
+
+    async def _hold(
+        self,
+        channel: str,
+        thread_ts: str | None,
+        body: str,
+        reason: str,
+        room: shared_room.RoomFacts,
+    ) -> None:
+        """The fixed line in the room, the result to each owner's DM. A failed
+        post raises, as every post here does, so the worker retries."""
+        logger.warning("jobs: result held from shared room %s: %s", channel, reason)
+        await self._client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=shared_room.HELD_REPLY
+        )
+        if not room.owner_dm_channels:
+            logger.error(
+                "jobs: result held from %s has no owner DM to go to "
+                "(slack.owner_senders unset or unusable); it stays in the job record",
+                channel,
+            )
+            return
+        notice = shared_room.held_notice(f"channel {channel}", reason, body)
+        for dm in sorted(room.owner_dm_channels):
+            await self._post(dm, None, notice)
+
+    async def _post(self, channel: str, thread_ts: str | None, body: str) -> None:
         blocks = _blocks(body)
         # Post in batches of at most SLACK_MAX_BLOCKS so a large result is
         # delivered across several messages instead of tripping Slack's

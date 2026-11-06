@@ -26,9 +26,12 @@ HELD_REPLY = "收到，處理中，有結果會再回覆。"
 _EDGE_BEFORE = r"(?<![A-Za-z0-9_])"
 _EDGE_AFTER = r"(?![A-Za-z0-9_])"
 
-# A link into a channel: a web permalink (`/archives/<id>`) or an app link
-# (`slack://channel?...id=<id>`). Only the id is captured.
-_CHANNEL_LINK = re.compile(r"(?:/archives/|[?&]id=)([CDG][A-Z0-9]{2,})")
+# A link into a channel: a web permalink (`/archives/<id>`), the web client
+# (`app.slack.com/client/<team>/<id>`), or an app link (`slack://channel?...id=<id>`,
+# whose `&` Slack may send escaped as `&amp;`). Only the id is captured.
+_CHANNEL_LINK = re.compile(
+    r"(?:/archives/|/client/T[A-Z0-9]+/|[?&;]id=)([CDG][A-Z0-9]{2,})"
+)
 
 
 @dataclass(frozen=True)

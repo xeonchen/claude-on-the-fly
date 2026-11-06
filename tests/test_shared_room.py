@@ -17,7 +17,7 @@ from claude_on_the_fly.shared_room import (
 )
 
 SEATS = ("Anyujin", "Karina", "IU", "Wonyoung", "Winter", "Desk")
-DESK_ID = r"\b20\d\d-\d\d-\d\d-[0-9a-f]{4}\b"
+DESK_ID = r"(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])"
 OWNER_DM = "D0OWNER1"
 
 
@@ -53,6 +53,20 @@ class TestMatches:
         reason = check("Tracked as 2026-11-06-7659.", rules(), SHARED)
         assert reason is not None
         assert "2026-11-06-7659" in reason
+
+    def test_a_desk_id_glued_to_chinese_text_holds(self):
+        assert check("已開工單2026-11-06-c7d3處理", rules(), SHARED) is not None
+
+    def test_a_desk_id_inside_a_longer_token_does_not(self):
+        assert check("build-2026-11-06-c7d3x", rules(), SHARED) is None
+
+    def test_an_owner_dm_client_url_holds(self):
+        text = f"https://app.slack.com/client/T0ABC/{OWNER_DM}"
+        assert check(text, rules(), SHARED) is not None
+
+    def test_an_owner_dm_app_link_with_escaped_ampersand_holds(self):
+        text = f"<slack://channel?team=T1&amp;id={OWNER_DM}|here>"
+        assert check(text, rules(), SHARED) is not None
 
     def test_an_owner_dm_permalink_holds(self):
         text = f"Details: https://acme.slack.com/archives/{OWNER_DM}/p1730880000123456"

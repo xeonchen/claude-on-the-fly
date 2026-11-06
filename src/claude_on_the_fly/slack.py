@@ -57,6 +57,7 @@ from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend, IncomingMessageHandler, LegacyWorkspace
+from claude_on_the_fly.shared_room_slack import SlackRooms, hold_rules_from_settings
 from claude_on_the_fly.slack_failed_events import FailedSlackEvents
 from claude_on_the_fly.slack_mrkdwn import (
     SLACK_MESSAGE_CHAR_LIMIT,
@@ -818,12 +819,6 @@ def _suggestion_blocks(labels: list[str]) -> list[dict]:
     ]
 
 
-def _setting_list(name: str, sep: str) -> list[str]:
-    """A list-valued setting, split on the separator its `Field` joins with."""
-    raw = settings.get(name, "")
-    return [item for item in raw.split(sep) if item.strip()]
-
-
 def _reply_messages(body: str, response: Response) -> list[tuple[str, list[dict]]]:
     """Render a Response as the messages Slack will take, in order.
 
@@ -1496,15 +1491,14 @@ class SlackFrontend(Frontend):
         # Cache definitive answers briefly, and never cache an answer produced by
         # an API failure.
         self._own_dm_ttl = 60.0
-        # channel -> (member ids, expiry) for the shared-room check. Same rule as
-        # `_own_dm`: a definitive answer is cached briefly, a failure never.
-        self._room_members_cache: dict[str, tuple[frozenset[str], float]] = {}
+        # Who can read a room, for the shared-room check. The job worker builds
+        # its own over its own client, so both mean the same by "shared".
+        self._rooms = SlackRooms(
+            self._app.client, owners=self._owner_ids, own_id=lambda: self._user_id
+        )
         # session -> whether someone besides an owner can read its room, resolved
         # with the session's metadata. Read by `session_facts` for the prompt line.
         self._shared_sessions: dict[int, bool] = {}
-        # Hold-pattern errors already logged, so a broken pattern is one ERROR
-        # per distinct message rather than one per reply.
-        self._logged_hold_errors: set[str] = set()
         self._connected_once = False
         self._workspace_names: dict[int, str] = {}
         # session -> the per-thread directory name this session had before
@@ -4499,6 +4493,9 @@ class SlackFrontend(Frontend):
         if await self._channel_type(channel) not in _INTERIM_CHANNEL_TYPES:
             logger.debug("progress: omitted outside a DM/group DM in %s", channel)
             return
+        # NOT run through the shared-room check (`send` is): a group DM, or a
+        # colleague's DM with the bot, would see progress text naming whatever
+        # slack.shared_room_* lists. Off unless interim progress is enabled.
         logger.info("slack %s/%s ~> %s", channel, thread_ts, logs.redact(text))
         chunk = _fit_progress_chunk(f"{INTERIM_PREFIX} {to_mrkdwn(text)}")
         messages = self._progress_messages.get(chat_id)
@@ -4833,19 +4830,7 @@ class SlackFrontend(Frontend):
     # --- Shared rooms: what a reply may say where others can read it ---
 
     def _hold_rules(self) -> shared_room.HoldRules:
-        """The configured hold rules, re-read live like every other sender list."""
-        rules, errors = shared_room.HoldRules.build(
-            _setting_list("SLACK_SHARED_ROOM_HOLD_NAMES", ","),
-            _setting_list("SLACK_SHARED_ROOM_HOLD_PATTERNS", "\n"),
-            _setting_list("SLACK_SHARED_ROOM_PEOPLE", ","),
-        )
-        for error in errors:
-            if error not in self._logged_hold_errors:
-                self._logged_hold_errors.add(error)
-                logger.error(
-                    "slack: slack.shared_room_hold_patterns: skipping %s", error
-                )
-        return rules
+        return hold_rules_from_settings()
 
     def _owner_ids(self) -> frozenset[str]:
         """The owners whose rooms are private to them. Empty without an owner
@@ -4853,34 +4838,6 @@ class SlackFrontend(Frontend):
         if not self._owner_list_in_force:
             return frozenset()
         return frozenset(self._owner_sender_ids)
-
-    async def _room_members(self, channel: str) -> frozenset[str] | None:
-        """Every member id of `channel`, or None if Slack would not say."""
-        cached = self._room_members_cache.get(channel)
-        now = time.monotonic()
-        if cached is not None and cached[1] > now:
-            return cached[0]
-        members: set[str] = set()
-        cursor = ""
-        try:
-            while True:
-                resp = await self._app.client.conversations_members(
-                    channel=channel, cursor=cursor or None, limit=200
-                )
-                members.update(resp.get("members", []))
-                cursor = (resp.get("response_metadata") or {}).get("next_cursor", "")
-                if not cursor:
-                    break
-        except Exception as exc:
-            logger.warning("shared_room: members of %s unreadable: %s", channel, exc)
-            return None
-        result = frozenset(members)
-        self._room_members_cache[channel] = (result, now + self._own_dm_ttl)
-        return result
-
-    async def _owner_dm_channels(self) -> frozenset[str]:
-        channels = [await self._open_dm_channel(owner) for owner in self._owner_ids()]
-        return frozenset(c for c in channels if c)
 
     async def _shared_room(
         self, channel: str
@@ -4893,12 +4850,9 @@ class SlackFrontend(Frontend):
         rules = self._hold_rules()
         if not rules.enabled:
             return None
-        members = await self._room_members(channel)
-        if not shared_room.is_shared(members, self._owner_ids(), self._user_id):
+        room = await self._rooms.facts(channel)
+        if room is None:
             return None
-        room = shared_room.RoomFacts(
-            shared=True, owner_dm_channels=await self._owner_dm_channels()
-        )
         return rules, room
 
     async def _hold_reply(
@@ -4932,7 +4886,7 @@ class SlackFrontend(Frontend):
         label = self.session_facts(chat_id).get("conversation", channel)
         notice = shared_room.held_notice(label, reason, response.body)
         held = Response(body=notice, attachments=response.attachments)
-        dm_channels = sorted(await self._owner_dm_channels())
+        dm_channels = sorted(await self._rooms.owner_dm_channels())
         if not dm_channels:
             logger.error(
                 "shared_room: reply held from %s has no owner DM to go to "
@@ -5152,9 +5106,7 @@ class SlackFrontend(Frontend):
             return
 
         if self._hold_rules().enabled:
-            self._shared_sessions[session_id] = shared_room.is_shared(
-                await self._room_members(channel), self._owner_ids(), self._user_id
-            )
+            self._shared_sessions[session_id] = await self._rooms.is_shared(channel)
 
         # The whole thread_ts, fraction included, with the dot swapped for a
         # dash so it reads as one path segment. Truncating to the integer

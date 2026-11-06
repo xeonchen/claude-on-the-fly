@@ -9978,7 +9978,8 @@ class TestSharedRoomSend:
     def _rules(self, frontend, monkeypatch):
         monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Karina,Desk")
         monkeypatch.setenv(
-            "SLACK_SHARED_ROOM_HOLD_PATTERNS", r"\b20\d\d-\d\d-\d\d-[0-9a-f]{4}\b"
+            "SLACK_SHARED_ROOM_HOLD_PATTERNS",
+            r"(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])",
         )
         monkeypatch.delenv("SLACK_SHARED_ROOM_PEOPLE", raising=False)
         frontend._pinned_owner_sender_ids = {"U_OWN"}
@@ -9988,6 +9989,7 @@ class TestSharedRoomSend:
         client.conversations_members.return_value = {
             "members": ["U_SELF", "U_OWN", "U_COLLEAGUE"]
         }
+        client.conversations_info.return_value = {"channel": {"is_mpim": True}}
         frontend._remember_session(7, "G1", "1.0")
 
     def _posts(self, frontend) -> list[dict]:
@@ -10008,6 +10010,12 @@ class TestSharedRoomSend:
         assert self.HOLD in dm["text"]
         # The agent's suggestion labels are its text too: none ride along.
         assert "Ask Karina" not in json.dumps(dm["blocks"])
+
+    async def test_a_desk_id_glued_to_chinese_is_held(self, frontend):
+        await frontend.send(7, Response(body="已開工單2026-11-06-c7d3處理"))
+        room, dm = self._posts(frontend)
+        assert room["text"] == "收到，處理中，有結果會再回覆。"
+        assert "2026-11-06-c7d3" in dm["text"]
 
     async def test_held_attachments_go_to_the_owner(self, frontend, tmp_path):
         path = tmp_path / "a.txt"
@@ -10072,19 +10080,42 @@ class TestSharedRoomSend:
         frontend._app.client.conversations_members.side_effect = Exception("boom")
         await frontend.send(7, Response(body=self.HOLD))
         assert self._posts(frontend)[0]["text"] == "收到，處理中，有結果會再回覆。"
-        assert "G1" not in frontend._room_members_cache
+        assert "G1" not in frontend._rooms._members
 
     async def test_membership_is_cached_briefly(self, frontend):
         await frontend.send(7, Response(body="hello"))
         await frontend.send(7, Response(body="again"))
         assert frontend._app.client.conversations_members.await_count == 1
 
-    async def test_membership_pages_are_followed(self, frontend):
-        frontend._app.client.conversations_members.side_effect = [
-            {"members": ["U_SELF", "U_OWN"], "response_metadata": {"next_cursor": "c"}},
-            {"members": ["U_COLLEAGUE"], "response_metadata": {"next_cursor": ""}},
-        ]
-        assert await frontend._room_members("G1") == {"U_SELF", "U_OWN", "U_COLLEAGUE"}
+    async def test_a_room_of_the_owner_and_bots_is_untouched(self, frontend):
+        """Another bot in the room is not a reader (an alert bot, say)."""
+        client = frontend._app.client
+        client.conversations_members.return_value = {
+            "members": ["U_SELF", "U_OWN", "U_ALERTBOT"]
+        }
+
+        async def users_info(*, user):
+            return {"user": {"name": user, "is_bot": user == "U_ALERTBOT"}}
+
+        client.users_info.side_effect = users_info
+        await frontend.send(7, Response(body=self.HOLD))
+        (post,) = self._posts(frontend)
+        assert self.HOLD in post["text"]
+
+    async def test_a_public_channel_with_only_the_owner_is_held(self, frontend):
+        """Anyone in the workspace can read a public channel without joining."""
+        client = frontend._app.client
+        client.conversations_info.return_value = {"channel": {"is_private": False}}
+        client.conversations_members.return_value = {"members": ["U_SELF", "U_OWN"]}
+        await frontend.send(7, Response(body=self.HOLD))
+        assert self._posts(frontend)[0]["text"] == "收到，處理中，有結果會再回覆。"
+
+    async def test_an_unreadable_room_type_is_held(self, frontend):
+        client = frontend._app.client
+        client.conversations_info.side_effect = Exception("boom")
+        client.conversations_members.return_value = {"members": ["U_SELF", "U_OWN"]}
+        await frontend.send(7, Response(body=self.HOLD))
+        assert self._posts(frontend)[0]["text"] == "收到，處理中，有結果會再回覆。"
 
     async def test_no_owner_list_holds_with_nowhere_to_send(self, frontend, caplog):
         frontend._pinned_owner_sender_ids = None
@@ -10124,20 +10155,23 @@ class TestSharedRoomSend:
             "slack:\n"
             "  shared_room_hold_names: [Karina, Winter]\n"
             "  shared_room_hold_patterns:\n"
-            "    - '\\b20\\d\\d-\\d\\d-\\d\\d-[0-9a-f]{4}\\b'\n"
+            "    - '(?<![A-Za-z0-9_])20\\d\\d-\\d\\d-\\d\\d-[0-9a-f]{4}(?![A-Za-z0-9_])'\n"
             "    - 'x{1,2} y'\n"
             "  shared_room_people: [Winter]\n"
         )
         rules = frontend._hold_rules()
         assert rules.names == ("Karina",)
         assert [p.pattern for p in rules.patterns] == [
-            r"\b20\d\d-\d\d-\d\d-[0-9a-f]{4}\b",
+            r"(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])",
             "x{1,2} y",
         ]
 
     def test_a_broken_pattern_is_logged_once(self, frontend, monkeypatch, caplog):
         monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_PATTERNS", "[unclosed")
-        with caplog.at_level("ERROR", logger="claude_on_the_fly.slack"):
+        monkeypatch.setattr(
+            "claude_on_the_fly.shared_room_slack._logged_hold_errors", set()
+        )
+        with caplog.at_level("ERROR", logger="claude_on_the_fly.shared_room_slack"):
             frontend._hold_rules()
             frontend._hold_rules()
         assert caplog.text.count("[unclosed") == 1
