@@ -10017,6 +10017,35 @@ class TestSharedRoomSend:
         assert got == [path]
         upload.assert_awaited_once_with("D_OWN", None, [path])
 
+    async def test_a_matching_suggestion_label_drops_the_menu(self, frontend, caplog):
+        response = Response(
+            body="Done, see above.", suggestions=["Ask Karina", "Retry"]
+        )
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend.send(7, response)
+        (post,) = self._posts(frontend)
+        assert post["channel"] == "G1"
+        assert "Done, see above." in post["text"]
+        dumped = json.dumps(post["blocks"])
+        assert "Ask Karina" not in dumped
+        assert "Retry" not in dumped
+        assert "suggestions dropped" in caplog.text
+        # The reply kept its own suggestions object untouched.
+        assert response.suggestions == ["Ask Karina", "Retry"]
+
+    async def test_clean_suggestion_labels_stay(self, frontend):
+        await frontend.send(7, Response(body="Done.", suggestions=["Retry"]))
+        (post,) = self._posts(frontend)
+        assert "Retry" in json.dumps(post["blocks"])
+
+    async def test_an_owner_only_room_keeps_matching_labels(self, frontend):
+        frontend._app.client.conversations_members.return_value = {
+            "members": ["U_SELF", "U_OWN"]
+        }
+        await frontend.send(7, Response(body="Done.", suggestions=["Ask Karina"]))
+        (post,) = self._posts(frontend)
+        assert "Ask Karina" in json.dumps(post["blocks"])
+
     async def test_a_room_with_only_the_owner_is_untouched(self, frontend):
         frontend._app.client.conversations_members.return_value = {
             "members": ["U_SELF", "U_OWN"]
