@@ -209,7 +209,7 @@ async def test_fallback_text_summarises_the_first_line() -> None:
 # ---------------------------------------------------------------------------
 
 HELD = "收到，處理中，有結果會再回覆。"
-HOLD_TEXT = "Opened 2026-11-06-c7d3 for Karina."
+HOLD_TEXT = "Opened 2030-01-02-cd34 for Borealis."
 
 
 class _Rooms:
@@ -228,7 +228,7 @@ class _Rooms:
 
 @pytest.fixture
 def hold_rules(monkeypatch):
-    monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Karina")
+    monkeypatch.setenv("SLACK_SHARED_ROOM_HOLD_NAMES", "Borealis")
     monkeypatch.setenv(
         "SLACK_SHARED_ROOM_HOLD_PATTERNS",
         r"(?<![A-Za-z0-9_])20\d\d-\d\d-\d\d-[0-9a-f]{4}(?![A-Za-z0-9_])",
@@ -257,7 +257,7 @@ async def test_a_matching_result_in_a_shared_room_is_held(hold_rules) -> None:
 async def test_a_failed_job_text_is_checked_too(hold_rules) -> None:
     client = _client()
     notifier = SlackThreadNotifier(client, rooms=_Rooms(shared=True))
-    await notifier.notify({"channel": "G1"}, Result(ok=False, text="Karina crashed"))
+    await notifier.notify({"channel": "G1"}, Result(ok=False, text="Borealis crashed"))
     assert _posts(client)[0]["text"] == HELD
 
 

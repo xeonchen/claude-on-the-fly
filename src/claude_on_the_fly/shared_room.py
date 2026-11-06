@@ -21,7 +21,7 @@ from dataclasses import dataclass
 HELD_REPLY = "收到，處理中，有結果會再回覆。"
 
 # A name is a whole token. Not `\b`: CJK characters are word characters to `\b`,
-# so 「交給Karina處理」 has no boundary around the name at all. Only an ASCII
+# so 「交給Borealis處理」 has no boundary around the name at all. Only an ASCII
 # letter, digit or underscore next to it makes it part of a longer word.
 _EDGE_BEFORE = r"(?<![A-Za-z0-9_])"
 _EDGE_AFTER = r"(?![A-Za-z0-9_])"
@@ -92,7 +92,7 @@ def check(text: str, rules: HoldRules, room: RoomFacts) -> str | None:
     """The reason to hold `text` out of `room`, or None to post it.
 
     Names are case-sensitive whole tokens: "Desk" the system holds, "help desk"
-    and "Desktop" do not, and neither does "winter" the season."""
+    and "Desktop" do not, and neither does "spring" the season."""
     if not room.shared:
         return None
     for name in rules.names:
